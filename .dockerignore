@@ -1,0 +1,22 @@
+vnbot/
+.venv/
+__pycache__/
+*.pyc
+.git/
+reference/
+tests/
+docs/
+*.md
+.github/
+
+# Bind-mounted at runtime, so a copy baked into the image is never read.
+data/
+
+# Secrets and local settings are mounted or read at runtime; they never belong in an image.
+token.json
+config.json
+.env
+*.log
+sub-bots/anime-bot/token.json
+sub-bots/anime-bot/config.json
+sub-bots/anime-bot/data/

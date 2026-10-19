@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets and local settings
+token.json
+config.json
+.env
+*.env
+
+# Runtime data and logs
+data/
+*.log
+
+# Backups
+*.bak
+*.backup
+
+# Editors and system files
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test caches
+.pytest_cache/

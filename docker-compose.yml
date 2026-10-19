@@ -1,0 +1,30 @@
+services:
+  muramasa:
+    build: .
+    container_name: muramasa
+    restart: unless-stopped
+    # Cap RAM so a runaway image decode can't OOM the host.
+    mem_limit: 1g
+    ports:
+      - "${CONSOLE_BIND_IP:-127.0.0.1}:5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./token.json:/app/token.json:ro
+      - ./config.json:/app/config.json
+      - ./.env:/app/.env:ro
+      - ./sub-bots/anime-bot/token.json:/app/sub-bots/anime-bot/token.json:ro
+      - ./sub-bots/anime-bot/config.json:/app/sub-bots/anime-bot/config.json
+      # Hikaru bot data (for web console cross-bot access).
+      # Data dir is :rw because the console's pool / cycle / votes /
+      # guild_managers admin endpoints write back to hikaru's DB.
+      # SQLite's file lock serializes against hikaru's own writes, which
+      # is enough at this traffic. The log stays :ro; muramasa never
+      # writes to it.
+      - ../hikaru/data:/hikaru-data:rw
+      - ../hikaru/hikaru_bot.log:/hikaru-log/hikaru_bot.log:ro
+    env_file:
+      - .env
+    environment:
+      # Listen on every interface inside the container; the ports mapping above
+      # decides who can reach it.
+      - WEB_CONSOLE_HOST=0.0.0.0

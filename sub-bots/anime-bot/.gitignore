@@ -1,0 +1,9 @@
+# Anime Bot - ignore token and local data
+token.json
+*.db
+*.sqlite
+*.log
+__pycache__/
+*.pyc
+.env
+data/
