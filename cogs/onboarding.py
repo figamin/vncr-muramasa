@@ -919,28 +919,10 @@ class OnboardingCog(commands.Cog):
         if isinstance(member, discord.Member):
             await self._set_applying(member, True)
 
-        verification = self._verification_cog()
-        already = verification.get_highest_quiz_level(member.id) if verification else 0
-        if already >= 1:
-            # The quiz has been passed before and the record survives a departure, so
-            # asking for it again tests nothing. Only the application is outstanding.
-            await self.db.update_verification_application(app_id, thread_id=thread.id)
-            app = await self.db.get_application_by_id(app_id)
-            await self._advance_to_review(
-                member, app, already,
-                f"{member.mention} You have already passed level {already}, so there is "
-                "no quiz this time. Your application is with the moderators and you "
-                "will hear back in this thread.\n\n"
-                f"すでにレベル{already}に合格しているため、今回クイズはありません。"
-                "審査結果はこのスレッドでお知らせします。",
-            )
-            await interaction.followup.send(
-                f"You have already passed level {already}, so no quiz is needed. Your "
-                f"application is with the moderators: {thread.mention}",
-                ephemeral=True,
-            )
-            return
-
+        # The quiz is always required, whatever the tracked level says. Access is granted
+        # by this flow, not by a record carried over from a previous membership, so a
+        # returning member is treated exactly like a first-time applicant. Their old
+        # level is not lost: approval keeps the higher of the entry pass and that level.
         embed = discord.Embed(
             title="Almost there / あと少し",
             description=(
@@ -1099,8 +1081,8 @@ class OnboardingCog(commands.Cog):
     ) -> bool:
         """Claim the application for review and tell both sides.
 
-        Reached either by passing the entry quiz or by already holding a level, so the
-        message that lands in the thread is supplied by the caller.
+        Reached only by passing the entry quiz in the applicant's own thread; the
+        message that lands there is supplied by the caller.
         """
         if not await self.db.claim_application_for_review(
             app["id"], level, _utc_now_sql()
@@ -1478,13 +1460,13 @@ class OnboardingCog(commands.Cog):
         failure = "Could not assign the roles. Check my role position and try again."
         if verification:
             # An applicant can already hold a level without holding Confirmed Reader:
-            # restore_user_roles hands the numeric role back to any returning member with
-            # tracked progress, but only grants Confirmed Reader to one recorded as
-            # verified. Such a member applies, passes the entry quiz, and would otherwise
-            # be written down to level 1 here, since _perform_role_updates strips every
-            # other level role and set_highest_quiz_level overwrites the record. The
-            # sequential path refuses that case outright; this one keeps the higher of
-            # the two instead, because refusing would leave them without access.
+            # a numeric role can be assigned by hand, and a tracked record survives a
+            # departure without granting anything. Such a member applies, passes the
+            # entry quiz, and would otherwise be written down to level 1 here, since
+            # _perform_role_updates strips every other level role and
+            # set_highest_quiz_level overwrites the record. The sequential path refuses
+            # that case outright; this one keeps the higher of the two instead, because
+            # refusing would leave them without access.
             level = max(passed, verification.get_highest_quiz_level(member.id))
             try:
                 await verification.ensure_roles_exist(guild)

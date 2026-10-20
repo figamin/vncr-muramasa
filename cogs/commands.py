@@ -227,24 +227,12 @@ class CommandsCog(commands.Cog):
                 )
                 return
 
-            # Get verification cog to update quiz data if they don't have any level yet
+            # Record them as verified without inventing a quiz level. Level 0 is no
+            # longer used as a placeholder, so a manually confirmed member keeps whatever
+            # progress is tracked (usually none) and gains no rank role until they pass a
+            # quiz themselves.
             verification_cog = self.bot.get_cog('VerificationCog')
             if verification_cog:
-                current_level = verification_cog.get_highest_quiz_level(user.id)
-                user_id_str = str(user.id)
-                has_tracked_data = user_id_str in verification_cog.verification_data["highest_quiz_levels"]
-                
-                # If user has no quiz tracking data, set them to level 0 (manual confirmation, no quiz passed)
-                if not has_tracked_data:
-                    verification_cog.verification_data["highest_quiz_levels"][user_id_str] = 0
-                    verification_cog.save_verification_data()
-                    
-                    # Ensure they have level 0 role
-                    level_0_role = discord.utils.get(interaction.guild.roles, name="0")
-                    if level_0_role and level_0_role not in user.roles:
-                        await user.add_roles(level_0_role, reason=f"Manual confirmation by {interaction.user.name}")
-                
-                # Add to verified users list so Confirmed Reader will be restored on rejoin
                 verification_cog.add_verified_user(user.id)
 
             await user.add_roles(role, reason=f"Promoted to {role_name} by {interaction.user.name}")

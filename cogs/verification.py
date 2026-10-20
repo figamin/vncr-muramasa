@@ -149,8 +149,6 @@ class VerificationCog(commands.Cog):
                 await self.migrate_high_level_users(guild)
                 # Then sync data
                 await self.sync_verification_data(guild)
-                # Assign level 0 to any Confirmed Reader users without tracked quiz levels
-                await self.assign_level_0_to_untracked_users(guild)
 
     def load_verification_data(self) -> Dict:
         """Load and validate verification data from file"""
@@ -277,44 +275,6 @@ class VerificationCog(commands.Cog):
                 
         except Exception as e:
             print(f"❌ Error during high-level user migration: {e}")
-    
-    async def assign_level_0_to_untracked_users(self, guild):
-        """Assign level 0 to any users who don't have a quiz level tracked"""
-        try:            
-            level_0_role = discord.utils.get(guild.roles, name="0")
-            if not level_0_role:
-                return
-            
-            assigned_count = 0
-            for member in guild.members:
-                # Skip bots
-                if member.bot:
-                    continue
-                    
-                user_id = member.id
-                user_id_str = str(user_id)
-                
-                # If user has no tracked quiz level, assign them level 0
-                if user_id_str not in self.verification_data["highest_quiz_levels"]:
-                    # Set their highest quiz level to 0
-                    self.verification_data["highest_quiz_levels"][user_id_str] = 0
-                    
-                    # Assign level 0 role if they don't have it
-                    if level_0_role not in member.roles:
-                        try:
-                            await member.add_roles(level_0_role)
-                            print(f"Assigned level 0 role to untracked user {member.name}")
-                        except discord.Forbidden:
-                            print(f"Cannot assign level 0 role to {member.name}")
-                    
-                    assigned_count += 1
-            
-            if assigned_count > 0:
-                self.save_verification_data()
-                print(f"Assigned level 0 to {assigned_count} untracked users")
-                
-        except Exception as e:
-            print(f"Error assigning level 0 to untracked users: {e}")
     
     def save_verification_data(self):
         """Save verification data to file"""
@@ -464,24 +424,16 @@ class VerificationCog(commands.Cog):
                     actual_level = level
                     break
             
-            # If they have no level role, assign level 0
-            if actual_level is None:
-                level_0_role = discord.utils.get(guild.roles, name="0")
-                if level_0_role:
-                    try:
-                        await member.add_roles(level_0_role)
-                        actual_level = 0
-                        print(f"Assigned level 0 to user {member.name} (no level role)")
-                    except Exception as e:
-                        print(f"Error assigning level 0 to {member.name}: {e}")
-                        continue
-            
-            # Update tracking data to match actual level
-            current_tracked = self.verification_data["highest_quiz_levels"].get(user_id_str, None)
-            if current_tracked != actual_level:
-                self.verification_data["highest_quiz_levels"][user_id_str] = actual_level
-                print(f"Updated {member.name} quiz level: {current_tracked} → {actual_level}")
-                data_changed = True
+            # No level role means nothing has been earned yet. Nothing is assigned and
+            # the tracked value is left alone: level 0 is no longer used as a placeholder
+            # for "no quiz yet", because access comes from passing the entry quiz, not
+            # from a rank.
+            if actual_level is not None:
+                current_tracked = self.verification_data["highest_quiz_levels"].get(user_id_str, None)
+                if current_tracked != actual_level:
+                    self.verification_data["highest_quiz_levels"][user_id_str] = actual_level
+                    print(f"Updated {member.name} quiz level: {current_tracked} → {actual_level}")
+                    data_changed = True
             
             # Update verified users list based on Confirmed Reader role
             has_confirmed_reader = confirmed_reader_role and confirmed_reader_role in member.roles
@@ -937,103 +889,19 @@ class VerificationCog(commands.Cog):
     
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        """Handle new member joins and restore roles for returning users"""
-        guild_id = str(member.guild.id)
-        guild_config = self.bot.config['guilds'].get(guild_id, {})
-        
-        # Check if verification is enabled for this guild
-        if not guild_config.get('verification_enabled', False):
-            return
-        
-        verification_channel_id = guild_config.get('verification_channel')
-        
-        if not verification_channel_id:
-            return
-        
-        # Ensure roles exist
-        await self.ensure_roles_exist(member.guild)
-        
-        # Check if this user has previously passed any quiz levels
-        user_id = member.id
-        highest_level = self.get_highest_quiz_level(user_id)
-        
-        # Check if user has tracked quiz data (not just default 0 return)
-        user_id_str = str(user_id)
-        has_tracked_data = user_id_str in self.verification_data["highest_quiz_levels"]
-        
-        if has_tracked_data and highest_level > 0:
-            # User has a tracked quiz level above 0, restore their roles
-            await self.restore_user_roles(member, highest_level)
-            
-            # Get class role information from immersion cog
-            class_role_info = await self.get_user_class_info(member)
-            
-            # Send welcome back message to welcome channel (plain text format)
-            welcome_channel_id = self.bot.config['guilds'].get(guild_id, {}).get('welcome_channel')
+        """Nothing is restored or assigned here any more.
 
-            if welcome_channel_id:
-                welcome_channel = member.guild.get_channel(int(welcome_channel_id))
-                if welcome_channel:
-                    try:
-                        welcome_parts = [f"🔄 Welcome back, {member.mention}!"]
-                        welcome_parts.append(f"Your **Level {highest_level}** role has been restored.")
-                        
-                        if class_role_info:
-                            welcome_parts.append(f"Your **{class_role_info['class_name']}** class role has been restored ({class_role_info['vn_hours']:.1f}h VN time).")
-                        
-                        welcome_back_text = " ".join(welcome_parts)
-                        await welcome_channel.send(welcome_back_text)
-                    except discord.Forbidden:
-                        pass
-                    except Exception as e:
-                        print(f"Error sending welcome message: {e}")
-        elif has_tracked_data and highest_level == 0:
-            # User has tracked data but is at level 0, restore roles
-            await self.restore_user_roles(member, highest_level)
-            
-            # Check if they were a verified user (had server access before)
-            user_id_str = str(user_id)
-            was_verified = user_id_str in self.verification_data["verified_users"]
-            
-            if was_verified:
-                # Get class role information from immersion cog
-                class_role_info = await self.get_user_class_info(member)
-                
-                # Send welcome back message for returning verified users at level 0
-                welcome_channel_id = self.bot.config['guilds'].get(guild_id, {}).get('welcome_channel')
+        Access is granted only by the onboarding flow. A quiz record carried over from a
+        previous membership used to restore roles, and with them Confirmed Reader — which
+        is what let a returning member skip the quiz. New members were also stamped with
+        the level-0 role, which only existed to mark the unverified state. Both are gone:
+        whoever joins applies and passes the entry quiz like anyone else. Their tracked
+        level survives, and approval keeps the higher of the entry pass and that level,
+        so old progress is not thrown away.
 
-                if welcome_channel_id:
-                    welcome_channel = member.guild.get_channel(int(welcome_channel_id))
-                    if welcome_channel:
-                        try:
-                            welcome_parts = [f"🔄 Welcome back, {member.mention}!"]
-                            welcome_parts.append("Your server access has been restored.")
-                            
-                            if class_role_info:
-                                welcome_parts.append(f"Your **{class_role_info['class_name']}** class role has been restored ({class_role_info['vn_hours']:.1f}h VN time).")
-                            
-                            welcome_back_text = " ".join(welcome_parts)
-                            await welcome_channel.send(welcome_back_text)
-                        except discord.Forbidden:
-                            pass
-                        except Exception as e:
-                            print(f"Error sending welcome message: {e}")
-        else:
-            # New user, assign unverified role
-            unverified_role = discord.utils.get(member.guild.roles, name="0")
-            
-            if not unverified_role:
-                print(f"Role '0' not found in guild {member.guild.name}")
-                return
-            
-            # Assign unverified role
-            try:
-                await member.add_roles(unverified_role)
-                print(f"Assigned unverified role to new user {member.name}")
-            except discord.Forbidden:
-                print(f"Cannot assign unverified role to {member.name}")
-        
-        # Note: Welcome message is handled by events.py to avoid duplication
+        Kept as an empty listener so the join-time hook stays visible to the next reader.
+        """
+        pass
     
     async def check_quiz_start(self, message):
         """Check if a user started a Level 1 quiz"""

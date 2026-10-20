@@ -447,8 +447,8 @@ class EventsCog(commands.Cog):
         the message needs to be told which one it hit rather than shown a success it
         did not get.
 
-        force lifts only the returning-member guard, which anyone testing this will trip
-        by definition: they hold a level themselves.
+        force lifts only the access guard, which anyone testing this can trip by holding
+        Confirmed Reader themselves.
         """
         guild_id = str(guild.id)
         guild_config = self.bot.config['guilds'].get(guild_id, {})
@@ -458,28 +458,16 @@ class EventsCog(commands.Cog):
             print(f"Welcome: verification is disabled for guild {guild_id}")
             return "verification is disabled for this server"
 
-        # A returning member who already holds a level is greeted by the verification
-        # cog, which restores their roles and says welcome back. Greeting them again here
-        # would hand them a Start verification button that can only tell them they are
-        # already in.
-        #
-        # The test is on the tracked level being above zero, matching the condition that
-        # welcome-back itself fires on. A zero entry is not a returning member: every
-        # member present at a restart is written in at zero by
-        # assign_level_0_to_untracked_users, so skipping on the key alone would silence
-        # both greetings and leave an ordinary arrival with no way in at all.
-        #
-        # Read from the tracked data rather than from their roles, because the role
-        # restore runs in a parallel listener and may not have landed yet.
-        verification = self.bot.get_cog("VerificationCog")
-        if verification is not None and not force:
-            try:
-                if verification.get_highest_quiz_level(member.id) > 0:
-                    print(f"Welcome: {member.id} already holds a level, greeting skipped")
-                    return ("they already hold a quiz level, so the greeting is skipped "
-                            "for them as a returning member")
-            except Exception as exc:
-                print(f"Welcome: cannot check returning status: {exc}")
+        # Greeting is skipped only for someone who already has access: the button on this
+        # message could only tell them they are already in. The Confirmed Reader role is
+        # the test, not the tracked quiz level, because a level carried over from a
+        # previous membership no longer admits anyone — returning members go through the
+        # flow again and need this message like any other arrival.
+        if not force:
+            confirmed_reader = discord.utils.get(guild.roles, name="Confirmed Reader")
+            if confirmed_reader is not None and confirmed_reader in member.roles:
+                print(f"Welcome: {member.id} already has access, greeting skipped")
+                return "they already have access, so the greeting is skipped for them"
 
         channel = await self._welcome_target(guild)
         if channel is None:
