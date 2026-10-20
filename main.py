@@ -32,10 +32,27 @@ TOKEN_FILE = 'token.json'
 DEFAULT_CONFIG = {'guilds': {}}
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return DEFAULT_CONFIG
+    if not os.path.exists(CONFIG_FILE):
+        # Loud on purpose. Every per-guild feature (verification, quiz levels, welcome
+        # messages, highlights, ...) reads its switches from this file, so starting
+        # without it leaves them all silently off: the bot looks like it is ignoring
+        # its settings rather than like it failed to start.
+        logger.error(
+            "%s is missing from %s; starting with an empty guild configuration. "
+            "Per-guild features stay disabled until it is created. A file containing "
+            "{} is enough: /manage_* commands and the web console fill it in.",
+            CONFIG_FILE, os.getcwd(),
+        )
+        return dict(DEFAULT_CONFIG, guilds={})
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        logger.error("%s does not contain a JSON object; ignoring its contents.", CONFIG_FILE)
+        return dict(DEFAULT_CONFIG, guilds={})
+    # The README tells operators to create the file containing {}, and several callers
+    # index bot.config['guilds'] directly, so the key is normalised here.
+    config.setdefault('guilds', {})
+    return config
 
 def save_config(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:

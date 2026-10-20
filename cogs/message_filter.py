@@ -44,6 +44,25 @@ MAX_WEBHOOK_FILES = 10
 # Discord attachment flag bit for a spoiler (IS_SPOILER = 1 << 3, documented and
 # stable). Checked directly as well, since not every discord.py version reads it.
 ATTACHMENT_SPOILER_FLAG = 1 << 3
+# Discord's elevated-MFA gate (error 60003). In a guild that requires 2FA for
+# moderation the check is made against the bot OWNER's account, not the bot: bots
+# cannot carry 2FA, so no permission the bot holds gets past it. Webhook management
+# and deleting another member's message both sit behind this gate, which is why the
+# filter stops wholesale when the owner's 2FA is off. Spelled out here so the log
+# says what to fix instead of just relaying "Two factor is required for this
+# operation".
+MFA_REQUIRED_CODE = 60003
+MFA_REQUIRED_HINT = (
+    " — this server requires 2FA for moderation and the bot's owner has not enabled "
+    "2FA on their Discord account; bots cannot satisfy that check themselves, so "
+    "enable 2FA on the application owner's account"
+)
+
+
+def _mfa_hint(exc) -> str:
+    """Actionable suffix for a 60003 error, empty for anything else."""
+    return MFA_REQUIRED_HINT if getattr(exc, "code", None) == MFA_REQUIRED_CODE else ""
+
 # Leading marker of the subtext reply line used for link-media reply reposts (see
 # _build_reply_line). The edit modal keys off this to strip the line back out, so the
 # two must stay in sync.
@@ -427,8 +446,9 @@ class MessageFilterCog(commands.Cog):
             sent = await self._repost(message, content, reply_embed, thread, parent, allowed, view=view)
         except (discord.Forbidden, discord.HTTPException) as exc:
             # Fail open: the first chunk never posted, so leave the original untouched.
-            logger.warning("Repost failed in #%s (%s); leaving original.",
-                           getattr(message.channel, "name", message.channel.id), exc)
+            logger.warning("Repost failed in #%s (%s)%s; leaving original.",
+                           getattr(message.channel, "name", message.channel.id), exc,
+                           _mfa_hint(exc))
             return
 
         # A persistent RepostMenuView is already registered globally in cog_load, so the menu
@@ -708,9 +728,10 @@ class MessageFilterCog(commands.Cog):
             return True
         except discord.NotFound:
             return True
-        except discord.Forbidden:
-            logger.warning("Filtered a message but lacked Manage Messages to delete it in #%s.",
-                           getattr(message.channel, "name", message.channel.id))
+        except discord.Forbidden as exc:
+            logger.warning("Filtered a message but lacked Manage Messages to delete it in #%s%s",
+                           getattr(message.channel, "name", message.channel.id),
+                           _mfa_hint(exc) or ".")
             return False
         except discord.HTTPException as exc:
             logger.warning("Failed to delete filtered message: %s", exc)
