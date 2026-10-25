@@ -41,19 +41,24 @@ class UserTimeService:
             return timezone.utc
     
     @staticmethod
-    def _nearest_year_last_reading(raw: str, user_tz: timezone) -> Optional[datetime]:
-        """d/d/yyyy read as whichever of month-first and day-first lands closest to now.
+    def _nearest_slash_reading(raw: str, user_tz: timezone) -> Optional[datetime]:
+        """d/d/yyyy or yyyy/d/d read as whichever of month-first and day-first is nearer now.
 
-        Both readings are real dates whenever neither leading number exceeds 12, and no
-        fixed convention settles which was meant: `10/11/2026` is October 11th to an
-        American and 10 November to anyone else. The recent date is the better guess,
-        because these fields are written by someone logging something that has already
-        happened, not scheduling the far future. When only one field can hold a given
-        number (`26/10/2026`) there is a single candidate and the same comparison picks
-        it, so no separate path is needed for unambiguous input.
+        Both ways of writing a date are common, and both are ambiguous in the same place:
+        `10/11/2026` is October 11th to an American and 10 November to anyone else, and
+        `2026/10/11` carries exactly those same two readings with the year moved to the
+        front. No fixed convention settles which was meant, so the recent date is taken as
+        the intended one: these fields are typed by someone logging something that has
+        already happened, not scheduling the far future. When only one field can hold a
+        given number (`26/10/2026`) there is a single candidate and the same comparison
+        picks it, so unambiguous input needs no separate path.
 
-        Returns None when the string is not a year-last slash date, including the
-        year-first form, which has no ambiguity and is left to the fixed formats. Raises
+        A two-digit year is only 20YY, never 19YY. The year is expanded here rather than
+        parsed with %y, which would map 69-99 back into the 1900s, and such a date cannot
+        be in the future, since a year that can only be this century names something that
+        has happened.
+
+        Returns None when the string is not a slash date of either shape. Raises
         ValueError when a two-digit year resolves to a date after today.
         """
         pieces = raw.split()
@@ -65,29 +70,38 @@ class UserTimeService:
         fields = date_part.split("/")
         if len(fields) != 3 or not all(field.isdigit() for field in fields):
             return None
-        first, second, year = fields
-        if len(year) not in (2, 4) or len(first) > 2 or len(second) > 2:
-            return None
+        first, second, third = fields
 
-        # '26' means 2026 and never 1926. The year is expanded here rather than parsed
-        # with %y, which would map 69-99 back into the 1900s and so not be "always 20".
-        short_year = len(year) == 2
-        expanded = f"{first}/{second}/20{year}" if short_year else date_part
-        candidate = f"{expanded} {clock_part}" if clock_part else expanded
-
-        if clock_part is None:
-            formats = ("%m/%d/%Y", "%d/%m/%Y")
-        elif clock_part.count(":") == 1:
-            formats = ("%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M")
-        elif clock_part.count(":") == 2:
-            formats = ("%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S")
+        short_year = False
+        if len(first) == 4 and len(second) <= 2 and len(third) <= 2:
+            # Year first: 2026/10/11 and 2026/11/10 are the same pair of readings as the
+            # year-last forms below, just written the other way round.
+            year = first
+            expanded = date_part
+            date_formats = ("%Y/%m/%d", "%Y/%d/%m")
+        elif len(third) in (2, 4) and len(first) <= 2 and len(second) <= 2:
+            # Year last: 10/11/2026, or 10/11/26 for this century.
+            year = third
+            short_year = len(third) == 2
+            expanded = f"{first}/{second}/20{third}" if short_year else date_part
+            date_formats = ("%m/%d/%Y", "%d/%m/%Y")
         else:
             return None
 
+        if clock_part is None:
+            clock_format = ""
+        elif clock_part.count(":") == 1:
+            clock_format = " %H:%M"
+        elif clock_part.count(":") == 2:
+            clock_format = " %H:%M:%S"
+        else:
+            return None
+        candidate = f"{expanded} {clock_part}" if clock_part else expanded
+
         readings = []
-        for fmt in formats:
+        for fmt in date_formats:
             try:
-                parsed = datetime.strptime(candidate, fmt)
+                parsed = datetime.strptime(candidate, fmt + clock_format)
             except ValueError:
                 continue
             if clock_part is None:
@@ -121,9 +135,9 @@ class UserTimeService:
         - Negative integers for days ago: -0, -1, ..., -7
         - Weekday names: mon/monday, tue/tuesday, ... (most recent occurrence within last 7 days)
         - Short month/day: 6/15, 06-15, 6-15 (year inferred; rolls to prior year if future)
-        - Full dates: YYYY-MM-DD, YYYY/MM/DD (with optional HH:MM[:SS])
-        - Year-last slash dates, either convention: 10/11/2026 is read as MM/DD or DD/MM,
-          whichever lands nearer today
+        - Full date with dashes: YYYY-MM-DD (with optional HH:MM[:SS])
+        - Slash dates in either order: 10/11/2026, 2026/10/11 and 2026/11/10 are each
+          read as month-first or day-first, whichever lands nearer today
         - A two-digit year is read as 20YY and must not land after today: 10/11/26 is
           October 11th 2026
         """
@@ -185,26 +199,23 @@ class UserTimeService:
                             # Invalid month/day combo (e.g. 13/45): fall through to legacy formats
                             break
 
-            # Year-last slash dates, whichever way round the month and day were written.
-            # Placed before the fixed formats because those would silently commit to
-            # MM/DD for every ambiguous input.
-            ambiguous = self._nearest_year_last_reading(raw, user_tz)
+            # Slash dates, whichever way round the month and day were written and whichever
+            # end carries the year. Placed before the fixed formats because those would
+            # silently commit to one convention for every ambiguous input.
+            ambiguous = self._nearest_slash_reading(raw, user_tz)
             if ambiguous is not None:
                 return ambiguous
 
-            # Fixed formats, reached only by input the ambiguity check above declined:
-            # the ISO forms and the year-first slash form, which cannot be misread.
+            # Fixed formats, reached only by input the check above declined: the dashed
+            # ISO forms. Every slash date is decided above.
             time_formats = [
                 '%Y-%m-%d %H:%M:%S',
                 '%Y-%m-%d %H:%M',
-                '%Y/%m/%d %H:%M:%S',
-                '%Y/%m/%d %H:%M',
             ]
 
             # Legacy date-only formats (default to noon to avoid timezone date-shift issues)
             date_only_formats = [
                 '%Y-%m-%d',
-                '%Y/%m/%d'
             ]
 
             for fmt in time_formats:
