@@ -1107,7 +1107,7 @@ class VerificationCog(commands.Cog):
                         await message.channel.send(
                             f"🎯 **VERIFICATION QUIZ** started by {message.author.mention}!\n"
                             f"Good luck! Unlimited tries, no cooldown.\n"
-                            f"Guide: <https://vnclub.org/guide/> · Word list: <https://vnclub.org/level1/>"
+                            f"Guide: <https://vnclub.figamin.net/guide/> · Word list: <https://vnclub.figamin.net/level1/>"
                         )
                     else:
                         await message.channel.send(
@@ -1239,7 +1239,7 @@ class VerificationCog(commands.Cog):
                 if detected_level == 1:
                     await message.channel.send(
                         f"❌ Level 1 quiz incomplete. Don't give up - unlimited tries, no cooldown!\n"
-                        f"Guide: <https://vnclub.org/guide/> · Word list: <https://vnclub.org/level1/>\n"
+                        f"Guide: <https://vnclub.figamin.net/guide/> · Word list: <https://vnclub.figamin.net/level1/>\n"
                         f"`/quiz_verify` for the quiz command"
                     )
                 else:
@@ -1963,7 +1963,7 @@ class VerificationCog(commands.Cog):
             description=(
                 f"Copy and paste the command below to take the quiz. "
                 f"Score 8 points to pass (max 4 mistakes, 16s per question). Unlimited tries.\n\n"
-                f"Guide: https://vnclub.org/guide/ · Word list: https://vnclub.org/level1/\n\n"
+                f"Guide: https://vnclub.figamin.net/guide/ · Word list: https://vnclub.figamin.net/level1/\n\n"
                 f"認証のため、下のコマンドをコピペしてクイズに挑戦してください。合格点は8点、ミスは4回まで、制限時間は1問16秒です。何回でもチャレンジ可能です。"
             ),
             color=discord.Color.blue()

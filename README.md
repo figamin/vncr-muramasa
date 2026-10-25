@@ -30,7 +30,7 @@ The web console listens on port 5000. Under Docker it is published on `CONSOLE_B
 
 No images are included. `/motivation` posts a random file from `assets/motivation/`, the welcome message picks a random `assets/other/banner*.webp`, and the join flow's entry message uses `assets/other/hikaru_banner` (webp, png, jpg or gif). Each works without them; add your own to use them.
 
-Some messages link to vnclub.org pages, which are offline.
+Some messages link to vnclub.figamin.net pages, which are offline.
 
 ## License
 

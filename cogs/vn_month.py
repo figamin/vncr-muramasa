@@ -676,7 +676,7 @@ class VNMonthCog(commands.Cog):
         view.add_item(discord.ui.Button(
             label="VN Club",
             style=discord.ButtonStyle.link,
-            url=f"https://vnclub.org/vn/{vndb_id}",
+            url=f"https://vnclub.figamin.net/vn/{vndb_id}",
         ))
         return view
 

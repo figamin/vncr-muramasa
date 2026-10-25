@@ -5,6 +5,7 @@ Provides a browser-based interface for monitoring logs and managing the database
 import os
 import asyncio
 import aiosqlite
+import sqlite3
 from flask import Flask, render_template, jsonify, request, send_from_directory, Response
 from datetime import datetime
 from pathlib import Path
@@ -346,6 +347,12 @@ def clear_logs():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+@app.errorhandler(TimeoutError)
+def handle_loop_timeout(e):
+    """A stalled bot event loop is a 503, not a 500 with a traceback in the console."""
+    logger.error(f"Bot event loop timed out serving {request.path}: {e}")
+    return jsonify({'success': False, 'error': str(e) or 'Bot event loop timed out'}), 503
+
 def run_async(coro, timeout=10):
     """Helper to run async code in sync context using the bot's event loop
 
@@ -359,6 +366,20 @@ def run_async(coro, timeout=10):
         future = asyncio.run_coroutine_threadsafe(coro, bot_instance.loop)
         try:
             return future.result(timeout=timeout)
+        except TimeoutError:
+            # A bare TimeoutError() with no text made this indistinguishable from a socket
+            # timeout, so name the coroutine and the likeliest cause. Cancel it too: leaving
+            # it queued means it may still run and mutate state after the request gave up.
+            name = getattr(coro, '__qualname__', None) or repr(coro)
+            logger.error(
+                "Coroutine %s did not finish within %ss; the bot event loop is "
+                "blocked or the coroutine is stuck. Cancelling it.",
+                name, timeout,
+            )
+            future.cancel()
+            raise TimeoutError(
+                f"{name} did not finish within {timeout}s - the bot event loop is blocked"
+            ) from None
         except Exception as e:
             logger.error(f"Error running coroutine in bot loop: {e}", exc_info=True)
             raise  # Re-raise the exception instead of returning None
@@ -804,29 +825,44 @@ def restore_backup():
 
 @app.route('/api/stats')
 def get_stats():
-    """Get database statistics"""
-    async def _get_stats():
-        try:
-            stats = {}
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get row counts for main tables
-                tables = ['vn_pool', 'user_completions', 'immersion_activities']
-                for table in tables:
-                    try:
-                        async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
-                            count = (await cursor.fetchone())[0]
-                            stats[table] = count
-                    except:
-                        stats[table] = 0
-                
-                # Get database file size
-                db_size = os.path.getsize(DB_PATH)
-                stats['db_size_mb'] = round(db_size / (1024 * 1024), 2)
-            
-            return jsonify({'success': True, 'stats': stats})
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)})
-    return run_async(_get_stats())
+    """Get database statistics.
+
+    This deliberately does not go through run_async(): it is three local COUNTs and a
+    stat, and routing it through the bot's event loop meant the panel failed whenever the
+    loop was busy (a profile-card render, a Discord burst, a backup) for longer than the
+    10s run_async default. sqlite3 runs on this Flask thread instead, bounded by the busy
+    timeout below so a concurrent writer can never hold the request open.
+    """
+    stats = {}
+    try:
+        # mode=rw reads and lets SQLite roll back a hot journal, but never creates the file.
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=rw", uri=True, timeout=2.0)
+    except sqlite3.Error as e:
+        return jsonify({'success': False, 'error': f'Cannot open database: {e}'})
+
+    tables = ('vn_pool', 'user_completions', 'immersion_activities')
+    try:
+        conn.execute("PRAGMA busy_timeout = 2000")
+        for index, table in enumerate(tables):
+            try:
+                stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.Error as e:
+                # One lock blocks every table, so stop paying the busy timeout once per
+                # table: report the rest as unknown instead of stalling for 3x2s.
+                logger.warning(f"Stats: cannot count {table}: {e}")
+                stats['busy'] = True
+                for skipped in tables[index:]:
+                    stats[skipped] = None
+                break
+    finally:
+        conn.close()
+
+    try:
+        stats['db_size_mb'] = round(os.path.getsize(DB_PATH) / (1024 * 1024), 2)
+    except OSError as e:
+        return jsonify({'success': False, 'error': f'Cannot read database size: {e}'})
+
+    return jsonify({'success': True, 'stats': stats})
 
 @app.route('/api/info')
 def get_info():
@@ -6786,10 +6822,12 @@ def create_console_template(templates_dir):
                 const result = await response.json();
                 
                 if (result.success) {
-                    document.getElementById('stat-vn_pool').textContent = result.stats.vn_pool || 0;
-                    document.getElementById('stat-user_completions').textContent = result.stats.user_completions || 0;
-                    document.getElementById('stat-immersion_activities').textContent = result.stats.immersion_activities || 0;
-                    document.getElementById('stat-db_size').textContent = result.stats.db_size_mb + ' MB';
+                    // A busy database reports null counts rather than failing the whole panel.
+                    const stats = result.stats;
+                    document.getElementById('stat-vn_pool').textContent = stats.busy ? '—' : (stats.vn_pool ?? 0);
+                    document.getElementById('stat-user_completions').textContent = stats.busy ? '—' : (stats.user_completions ?? 0);
+                    document.getElementById('stat-immersion_activities').textContent = stats.busy ? '—' : (stats.immersion_activities ?? 0);
+                    document.getElementById('stat-db_size').textContent = stats.db_size_mb + ' MB';
                 }
             } catch (error) {
                 console.error('Error loading stats:', error);

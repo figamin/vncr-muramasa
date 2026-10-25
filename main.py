@@ -123,7 +123,7 @@ async def on_ready():
             name="/help"
         )
     )
-    logger.info('Bot status set to: /help | vnclub.org')
+    logger.info('Bot status set to: /help | vnclub.figamin.net')
     
     try:
         # Full sync; Discord handles the diff

@@ -154,7 +154,7 @@ class CommandsCog(commands.Cog):
     async def guide(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="The Guide",
-            description="Check out [the guide](https://vnclub.org/guide/) to start your Japanese immersion journey with visual novels",
+            description="Check out [the guide](https://vnclub.figamin.net/guide/) to start your Japanese immersion journey with visual novels",
             color=discord.Color.blue(),
             timestamp=discord.utils.utcnow()
         )
@@ -322,7 +322,7 @@ class CommandsCog(commands.Cog):
     async def resources(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="VN Club Resources",
-            description="Find useful resources for visual novel learning at [VN Club Resources](https://vnclub.org)",
+            description="Find useful resources for visual novel learning at [VN Club Resources](https://vnclub.figamin.net)",
             color=discord.Color.gold(),
             timestamp=discord.utils.utcnow()
         )
@@ -333,7 +333,7 @@ class CommandsCog(commands.Cog):
     async def getvns(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="Get Visual Novels",
-            description="Looking for visual novels? Check out the [sources page](https://vnclub.org/sources/) for links and info.",
+            description="Looking for visual novels? Check out the [sources page](https://vnclub.figamin.net/sources/) for links and info.",
             color=discord.Color.orange(),
             timestamp=discord.utils.utcnow()
         )

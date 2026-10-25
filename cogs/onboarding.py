@@ -35,14 +35,14 @@ COMMAND_BUTTON_ID = "onboarding:command"
 
 # The deck the entry quiz draws from, published so the quiz stays a test of effort
 # rather than of recall.
-WORD_LIST_URL = "https://vnclub.org/level1/"
+WORD_LIST_URL = "https://vnclub.figamin.net/level1/"
 
 # How often the native join-request queue is checked. discord.py has no parser for
 # GUILD_JOIN_REQUEST_CREATE, so nothing is dispatched to listen for and polling is the
 # only route. A minute is well inside what an applicant will tolerate and costs one
 # request per guild per minute.
 JOIN_REQUEST_POLL_SECONDS = 60
-GUIDE_URL = "https://vnclub.org/guide/"
+GUIDE_URL = "https://vnclub.figamin.net/guide/"
 # The community's shared room on the kizuna texthooker, linked by /kizuna.
 KIZUNA_ROOM_URL = "https://kizuna-texthooker-ui.app/rooms/vncr"
 CONTACT_BUTTON_ID = "onboarding:contact"
