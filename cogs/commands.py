@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
+from pathlib import Path
 from typing import Optional
 import json
 import logging
@@ -10,9 +11,13 @@ import random
 logger = logging.getLogger(__name__)
 
 class CommandsCog(commands.Cog):
+    # Resolved from this file, not from the working directory. The bot is run from the
+    # repo root under Docker (/app) but can be started from anywhere directly, and a
+    # cwd-relative path then points at a folder that has no images in it.
+    MOTIVATION_DIR = Path(__file__).resolve().parent.parent / 'assets' / 'motivation'
+
     def __init__(self, bot):
         self.bot = bot
-        self.MOTIVATION_DIR = os.path.join('assets', 'motivation')
 
     async def resolve_user(self, user_input: str = None, member: discord.Member = None):
         """
