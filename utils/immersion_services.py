@@ -40,6 +40,79 @@ class UserTimeService:
             logger.warning(f"Error getting timezone for user {user_id}: {e}")
             return timezone.utc
     
+    @staticmethod
+    def _nearest_year_last_reading(raw: str, user_tz: timezone) -> Optional[datetime]:
+        """d/d/yyyy read as whichever of month-first and day-first lands closest to now.
+
+        Both readings are real dates whenever neither leading number exceeds 12, and no
+        fixed convention settles which was meant: `10/11/2026` is October 11th to an
+        American and 10 November to anyone else. The recent date is the better guess,
+        because these fields are written by someone logging something that has already
+        happened, not scheduling the far future. When only one field can hold a given
+        number (`26/10/2026`) there is a single candidate and the same comparison picks
+        it, so no separate path is needed for unambiguous input.
+
+        Returns None when the string is not a year-last slash date, including the
+        year-first form, which has no ambiguity and is left to the fixed formats. Raises
+        ValueError when a two-digit year resolves to a date after today.
+        """
+        pieces = raw.split()
+        if len(pieces) > 2:
+            return None
+        date_part = pieces[0]
+        clock_part = pieces[1] if len(pieces) == 2 else None
+
+        fields = date_part.split("/")
+        if len(fields) != 3 or not all(field.isdigit() for field in fields):
+            return None
+        first, second, year = fields
+        if len(year) not in (2, 4) or len(first) > 2 or len(second) > 2:
+            return None
+
+        # '26' means 2026 and never 1926. The year is expanded here rather than parsed
+        # with %y, which would map 69-99 back into the 1900s and so not be "always 20".
+        short_year = len(year) == 2
+        expanded = f"{first}/{second}/20{year}" if short_year else date_part
+        candidate = f"{expanded} {clock_part}" if clock_part else expanded
+
+        if clock_part is None:
+            formats = ("%m/%d/%Y", "%d/%m/%Y")
+        elif clock_part.count(":") == 1:
+            formats = ("%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M")
+        elif clock_part.count(":") == 2:
+            formats = ("%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S")
+        else:
+            return None
+
+        readings = []
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+            if clock_part is None:
+                # Noon, as for every other date-only form, so a timezone offset cannot
+                # move the date onto the previous or next day.
+                parsed = parsed.replace(hour=12, minute=0, second=0, microsecond=0)
+            readings.append(parsed.replace(tzinfo=user_tz))
+
+        if not readings:
+            return None
+        now = datetime.now(user_tz)
+        if short_year:
+            # A year that can only be this century names something that has happened,
+            # so a date still ahead is a typo rather than a plan and is refused instead
+            # of being logged into the future. Compared by date, not instant: today is
+            # not in the future merely because the clock has not reached noon yet.
+            readings = [reading for reading in readings if reading.date() <= now.date()]
+            if not readings:
+                raise ValueError(
+                    f"'{raw}' is in the future: a two-digit year is read as 20{year}, "
+                    "and the date must not be later than today."
+                )
+        # The past reading wins an exact tie; a logged activity is not usually ahead.
+        return min(readings, key=lambda dt: (abs(dt - now), dt > now))
+
     async def parse_user_datetime(self, user_id: str, guild_id: str, datetime_str: str) -> datetime:
         """Parse a datetime string in the user's timezone.
 
@@ -48,7 +121,11 @@ class UserTimeService:
         - Negative integers for days ago: -0, -1, ..., -7
         - Weekday names: mon/monday, tue/tuesday, ... (most recent occurrence within last 7 days)
         - Short month/day: 6/15, 06-15, 6-15 (year inferred; rolls to prior year if future)
-        - Full dates: YYYY-MM-DD, MM/DD/YYYY (with optional HH:MM[:SS])
+        - Full dates: YYYY-MM-DD, YYYY/MM/DD (with optional HH:MM[:SS])
+        - Year-last slash dates, either convention: 10/11/2026 is read as MM/DD or DD/MM,
+          whichever lands nearer today
+        - A two-digit year is read as 20YY and must not land after today: 10/11/26 is
+          October 11th 2026
         """
         try:
             user_tz = await self.get_time_location(user_id, guild_id)
@@ -108,18 +185,26 @@ class UserTimeService:
                             # Invalid month/day combo (e.g. 13/45): fall through to legacy formats
                             break
 
-            # Legacy formats with time components
+            # Year-last slash dates, whichever way round the month and day were written.
+            # Placed before the fixed formats because those would silently commit to
+            # MM/DD for every ambiguous input.
+            ambiguous = self._nearest_year_last_reading(raw, user_tz)
+            if ambiguous is not None:
+                return ambiguous
+
+            # Fixed formats, reached only by input the ambiguity check above declined:
+            # the ISO forms and the year-first slash form, which cannot be misread.
             time_formats = [
                 '%Y-%m-%d %H:%M:%S',
                 '%Y-%m-%d %H:%M',
-                '%m/%d/%Y %H:%M:%S',
-                '%m/%d/%Y %H:%M',
+                '%Y/%m/%d %H:%M:%S',
+                '%Y/%m/%d %H:%M',
             ]
 
             # Legacy date-only formats (default to noon to avoid timezone date-shift issues)
             date_only_formats = [
                 '%Y-%m-%d',
-                '%m/%d/%Y'
+                '%Y/%m/%d'
             ]
 
             for fmt in time_formats:
@@ -138,8 +223,7 @@ class UserTimeService:
                     continue
 
             raise ValueError(
-                f"Unable to parse date '{datetime_str}'. "
-                f"Try 'yesterday', '-2' (days ago), 'mon', '6/15', or a full date like YYYY-MM-DD."
+                f"Unable to parse date '{datetime_str}'."
             )
 
         except Exception as e:

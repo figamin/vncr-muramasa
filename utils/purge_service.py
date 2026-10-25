@@ -715,13 +715,14 @@ def chunked(seq, size):
 
 
 def parse_purge_date(value):
-    """Parse a date as UTC. Accepts YYYY-MM-DD, 'YYYY-MM-DD HH:MM', and the ISO
-    'YYYY-MM-DDTHH:MM[:SS]' form an <input type=datetime-local> sends. None/blank ->
+    """Parse a date as UTC. Accepts YYYY-MM-DD, YYYY/MM/DD, 'YYYY-MM-DD HH:MM', and the
+    ISO 'YYYY-MM-DDTHH:MM[:SS]' form an <input type=datetime-local> sends. None/blank ->
     None; unparseable -> ValueError."""
     if not value or not str(value).strip():
         return None
     value = str(value).strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
         try:
             return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
