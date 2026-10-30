@@ -16,7 +16,7 @@ class EventsCog(ParentEventsCog):
     """Extended events cog with LJTA-specific welcome messages"""
     
     async def send_welcome_message(self, member: discord.Member, guild: discord.Guild):
-        """Send LJTA welcome message to new members with verification info"""
+        """Send LJTA welcome message to new members with level quiz info"""
         # Reload config from disk to pick up any web console changes
         if hasattr(self.bot, 'reload_config'):
             self.bot.reload_config()
@@ -42,43 +42,20 @@ class EventsCog(ParentEventsCog):
             color=0xFF69B4  # Pink color for anime theme
         )
 
-        # Verification Instructions field
+        # Level quizzes field
         embed.add_field(
-            name="📝 To access the rest of the server, complete a quick hiragana quiz:",
+            name="📚 Show off your level with our quizzes:",
             value=(
-                "**How it works:**\n"
-                "• A character will appear (e.g., あ, き)\n"
-                "• Type the correct reading in romaji (e.g., 'a', 'ki')\n"
-                "• You have 16 seconds per question\n"
-                "• Reach 8 correct answers to pass (max 4 mistakes allowed)"
-            ),
-            inline=False
-        )
-
-        # Important Info field
-        embed.add_field(
-            name="Important Info:",
-            value=(
-                "• 🎯 Deck: ljtakana (Hiragana)\n"
+                "• Six Kotoba quizzes: N5, N4, N3, N2, N1 and Insane (N0)\n"
+                "• Each one you pass gives you its level role\n"
                 "• ✅ Unlimited attempts - No cooldown between tries!\n"
-                "• 📚 Follow [this guide](https://donkuri.github.io/learn-japanese/guide/) and you'll pass quickly!\n"
-                "• 🏆 **Passing the quiz will unlock access to all channels, events, and our helpful community!**"
+                "• Use `/quizzes` to see all the commands"
             ),
-            inline=False
-        )
-
-        # Command section field
-        embed.add_field(
-            name="Copy and paste the command below exactly as it is:",
-            value=" ",
             inline=False
         )
 
         # Set the GIF as the image
         gif_path = Path(__file__).parent.parent / "assets" / "motivation" / "sakura-anki.gif"
-
-        # The quiz command in a separate message for easy copying
-        command_message = "k!quiz ljtakana 8 hardcore nd mmq=4 dauq=1 font=1 size=100 atl=16"
 
         try:
             # Send with the GIF attached and member mention
@@ -88,9 +65,6 @@ class EventsCog(ParentEventsCog):
                 await channel.send(content=f"{member.mention}", file=file, embed=embed)
             else:
                 await channel.send(content=f"{member.mention}", embed=embed)
-
-            # Send command in separate message for easy copying
-            await channel.send(command_message)
         except discord.Forbidden:
             pass
     
