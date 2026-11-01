@@ -7,6 +7,7 @@ anime-specific roles based on total anime watching time.
 
 OVERRIDES PROVIDED:
 ✅ _sync_reward_roles() - Uses anime time for role assignments (core override)
+✅ _sync_roles_and_notify() - Also tells the consequences cog after each log/undo
 ✅ profile - Shows anime-focused immersion profile
 ✅ Helper methods for anime class progress display
 
@@ -38,6 +39,7 @@ from cogs.immersion import (
     ImmersionCog as ParentImmersionCog,
     DEFAULT_SPECIAL_RANK_ROLES,
     ANIME_CLASS_ROLE_DEFINITIONS,
+    UndoLogButton,
     _format_hours_display,
 )
 from utils.database import Database
@@ -86,6 +88,9 @@ class ImmersionCog(ParentImmersionCog):
         await self.db.initialize()
         logger.info("Immersion tracking cog loaded")
 
+        # Undo buttons on log messages keep working across restarts
+        self.bot.add_dynamic_items(UndoLogButton)
+
         if not self.class_role_sync.is_running():
             self.class_role_sync.start()
 
@@ -93,7 +98,21 @@ class ImmersionCog(ParentImmersionCog):
             self._initial_sync_task = asyncio.create_task(self._initial_role_sync())
         
         logger.info("Anime immersion cog ready with custom command overrides")
-    
+
+    async def _sync_roles_and_notify(
+        self,
+        interaction: discord.Interaction,
+        source: str,
+        actor: Optional[Union[discord.Member, discord.User]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Parent role sync, plus a nudge to the consequences cog (penalty/reward roles).
+
+        Runs after every log and undo, so a penalty is lifted or a reward given straight away.
+        """
+        if interaction is not None and interaction.guild is not None and actor is not None:
+            self.bot.dispatch("anime_log_changed", interaction.guild, actor)
+        return await super()._sync_roles_and_notify(interaction, source, actor)
+
     async def _sync_reward_roles(self, guild: discord.Guild, source: str) -> Dict[str, int]:
         """
         Override role sync to use anime time instead of VN time for LJTA.

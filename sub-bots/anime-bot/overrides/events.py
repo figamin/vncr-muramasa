@@ -54,6 +54,18 @@ class EventsCog(ParentEventsCog):
             inline=False
         )
 
+        # Logging instructions field
+        embed.add_field(
+            name="📺 Log the anime you watch:",
+            value=(
+                "• After watching, use `/log_anime` with the name and number of episodes\n"
+                "• Example: `/log_anime name:Frieren episodes:3`\n"
+                "• It is not allowed to log anime you watched more than two weeks in the past\n\n"
+                "Make sure to log the anime you watch! Or face the consequences..."
+            ),
+            inline=False
+        )
+
         # Set the GIF as the image
         gif_path = Path(__file__).parent.parent / "assets" / "motivation" / "sakura-anki.gif"
 
