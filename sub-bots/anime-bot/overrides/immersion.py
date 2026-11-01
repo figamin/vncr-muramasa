@@ -635,21 +635,12 @@ class ImmersionCog(ParentImmersionCog):
         actor: Union[discord.Member, discord.User],
         change: Dict[str, Any],
     ) -> None:
-        """Send class promotions to the configured anime announcement channel."""
+        """Send class promotions to the announcement channel."""
         guild = getattr(interaction, "guild", None)
         if guild is None:
             return
 
-        # Reload config from disk to pick up any web console changes
-        if hasattr(self.bot, 'reload_config'):
-            self.bot.reload_config()
-
-        bot_config = getattr(self.bot, "config", {}) if hasattr(self, "bot") else {}
-        guild_config = (bot_config.get("guilds") or {}).get(str(guild.id), {})
-        channel_id = (
-            guild_config.get("class_announcements_channel")
-            or guild_config.get("class_announcement_channel")
-        )
+        channel_id = 1415732490815016972
 
         if channel_id:
             channel = guild.get_channel(int(channel_id))
