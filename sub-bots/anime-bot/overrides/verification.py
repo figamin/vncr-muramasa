@@ -1,6 +1,9 @@
 """
-LJTA (Learn Japanese Through Anime) - Verification Cog
-Simple hiragana quiz verification for server access.
+LJTA (Learn Japanese Through Anime) - Quiz Roles Cog
+Six Kotoba quizzes (N5 → Insane). Passing one grants its role.
+
+This file replaces the old hiragana verification quiz. It keeps the name
+verification.py so main.py loads it instead of the parent bot's verification cog.
 """
 
 import discord
@@ -13,599 +16,409 @@ import requests
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# QUIZ DEFINITIONS - edit names, messages and requirements here.
+#
+# Placeholders you can use in messages:
+#   {user}    - mention of the quiz taker
+#   {role}    - the quiz's level name as plain text, e.g. N5 (never pings the role)
+#   {name}    - the quiz's display name
+#   {command} - the quiz command
+#   {score}   - required score
+#   {issues}  - (failure_message only) bullet list of what went wrong
+# ---------------------------------------------------------------------------
+QUIZZES = [
+    {
+        "key": "n5",
+        "level": "N5",
+        "name": "N5 Quiz",
+        "emoji": "🌱",
+        "command": "k!q n5+10kn5 20 font=1 atl=10 mmq=5 nd",
+        "decks": {"n5", "10kn5"},
+        "score": 20,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237639523962900,
+        "description": "Beginner vocabulary (JLPT N5).",
+        "start_message": "🌱 N5 QUIZ started by {user}! Reach {score} points to earn {role}. Good luck! 🍀",
+        "success_message": "🎉 {user} passed the N5 Quiz and earned {role}!",
+        "announcement_message": "🌱 Congratulations {user} on passing the N5 Quiz! You now have {role}.",
+        "failure_message": "❌ {user}, your N5 Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+    {
+        "key": "n4",
+        "level": "N4",
+        "name": "N4 Quiz",
+        "emoji": "🌿",
+        "command": "k!q n4+10kn4 35 font=1 atl=10 mmq=5 nd",
+        "decks": {"n4", "10kn4"},
+        "score": 35,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237721887248506,
+        "description": "Elementary vocabulary (JLPT N4).",
+        "start_message": "🌿 N4 QUIZ started by {user}! Reach {score} points to earn {role}. Good luck! 🍀",
+        "success_message": "🎉 {user} passed the N4 Quiz and earned {role}!",
+        "announcement_message": "🌿 Congratulations {user} on passing the N4 Quiz! You now have {role}.",
+        "failure_message": "❌ {user}, your N4 Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+    {
+        "key": "n3",
+        "level": "N3",
+        "name": "N3 Quiz",
+        "emoji": "🌳",
+        "command": "k!q n3+10kn3 50 font=1 atl=10 mmq=5 nd",
+        "decks": {"n3", "10kn3"},
+        "score": 50,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237837163757660,
+        "description": "Intermediate vocabulary (JLPT N3).",
+        "start_message": "🌳 N3 QUIZ started by {user}! Reach {score} points to earn {role}. Good luck! 🍀",
+        "success_message": "🎉 {user} passed the N3 Quiz and earned {role}!",
+        "announcement_message": "🌳 Congratulations {user} on passing the N3 Quiz! You now have {role}.",
+        "failure_message": "❌ {user}, your N3 Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+    {
+        "key": "n2",
+        "level": "N2",
+        "name": "N2 Quiz",
+        "emoji": "⛰️",
+        "command": "k!q n2+10kn2 50 font=1 atl=10 mmq=5 nd",
+        "decks": {"n2", "10kn2"},
+        "score": 50,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237919044829404,
+        "description": "Upper-intermediate vocabulary (JLPT N2).",
+        "start_message": "⛰️ N2 QUIZ started by {user}! Reach {score} points to earn {role}. Good luck! 🍀",
+        "success_message": "🎉 {user} passed the N2 Quiz and earned {role}!",
+        "announcement_message": "⛰️ Congratulations {user} on passing the N2 Quiz! You now have {role}.",
+        "failure_message": "❌ {user}, your N2 Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+    {
+        "key": "n1",
+        "level": "N1",
+        "name": "N1 Quiz",
+        "emoji": "🗻",
+        "command": "k!q n1+10kn1 50 font=1 atl=10 mmq=5 nd",
+        "decks": {"n1", "10kn1"},
+        "score": 50,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237945787846878,
+        "description": "Advanced vocabulary (JLPT N1).",
+        "start_message": "🗻 N1 QUIZ started by {user}! Reach {score} points to earn {role}. Good luck! 🍀",
+        "success_message": "🎉 {user} passed the N1 Quiz and earned {role}!",
+        "announcement_message": "🗻 Congratulations {user} on passing the N1 Quiz! You now have {role}.",
+        "failure_message": "❌ {user}, your N1 Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+    {
+        "key": "insane",
+        "level": "N0",
+        "name": "Insane Quiz",
+        "emoji": "🔥",
+        "command": "k!q insane+haard 50 font=1 atl=10 mmq=5 nd",
+        "decks": {"insane", "haard"},
+        "score": 50,
+        "time_limit_ms": 10000,
+        "max_missed": 5,
+        "role_id": 1422237977060442324,
+        "description": "Beyond N1. Only for the brave.",
+        "start_message": "🔥 INSANE QUIZ started by {user}! Reach {score} points to earn {role}. Good luck... you'll need it! 💀",
+        "success_message": "🏆 {user} conquered the Insane Quiz and earned {role}!",
+        "announcement_message": "🔥 Incredible! {user} passed the Insane Quiz and earned {role}!",
+        "failure_message": "❌ {user}, your Insane Quiz didn't meet the requirements:\n{issues}\n\nYou can try again anytime! Use `/quizzes` to see the commands.",
+    },
+]
+
+# Channel where "someone passed" announcements are posted.
+ANNOUNCEMENT_CHANNEL_ID = 1415732490815016972
+
+# Shown when someone starts a quiz whose role they already have.
+ALREADY_HAVE_ROLE_START_MESSAGE = "🔄 {name} started by {user} - you already have {role}!"
+
+
+def _normalize_decks(decks) -> frozenset:
+    return frozenset(d.strip().lower() for d in decks if d and d.strip())
+
+
+def _required_tokens(quiz: dict) -> set:
+    """Everything in the quiz command after the decks, e.g. {"20", "font=1", "atl=10", "mmq=5", "nd"}."""
+    return set(quiz["command"].lower().split()[2:])
+
+
 class VerificationCog(commands.Cog):
-    """Verification cog for anime bot - simple hiragana quiz"""
+    """Kotoba quiz → role cog for the anime bot"""
 
-    # Kotoba bot ID
     KOTOBA_ID = 251239170058616833
-
-    # Quiz command for verification
-    QUIZ_COMMAND = "k!quiz ljtakana 8 hardcore nd mmq=4 dauq=1 font=1 size=100 atl=16"
-
-    # Required quiz settings
-    REQUIRED_DECKS = {"ljtakana"}
-    DECK_DISPLAY_NAME = "LJTA Verification Quiz"
-    REQUIRED_SCORE = 8
-    REQUIRED_TIME_LIMIT = 16000  # 16 seconds in ms
-    REQUIRED_MAX_MISSED = 4
 
     def __init__(self, bot):
         self.bot = bot
         self.data_dir = Path(__file__).parent.parent / 'data'
         self.data_dir.mkdir(exist_ok=True)
-        self.verification_data_file = self.data_dir / 'verification_data.json'
-        self.verification_data = self.load_verification_data()
+        self.data_file = self.data_dir / 'quiz_roles_data.json'
+        self.data = self.load_data()
+        # Look up quizzes by their exact deck set
+        self.quizzes_by_decks = {_normalize_decks(q["decks"]): q for q in QUIZZES}
 
-    def load_verification_data(self) -> dict:
-        """Load verification data from file"""
-        if self.verification_data_file.exists():
+    # ---------------- data (who passed what, for restoring on rejoin) ----------------
+
+    def load_data(self) -> dict:
+        if self.data_file.exists():
             try:
-                with open(self.verification_data_file, 'r') as f:
+                with open(self.data_file, 'r') as f:
                     data = json.load(f)
-                    # Ensure verified_users is a list of strings
-                    if isinstance(data.get("verified_users"), list):
-                        data["verified_users"] = [str(uid) for uid in data["verified_users"]]
-                    else:
-                        data["verified_users"] = []
+                if isinstance(data.get("passed"), dict):
                     return data
-            except (json.JSONDecodeError, FileNotFoundError) as e:
-                print(f"[Anime Verification] Error loading verification data: {e}")
-        return {"verified_users": []}
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[Anime Quiz] Error loading quiz data: {e}")
+        return {"passed": {q["key"]: [] for q in QUIZZES}}
 
-    def save_verification_data(self):
-        """Save verification data to file"""
+    def save_data(self):
         try:
-            with open(self.verification_data_file, 'w') as f:
-                json.dump(self.verification_data, f, indent=2)
+            with open(self.data_file, 'w') as f:
+                json.dump(self.data, f, indent=2)
         except Exception as e:
-            print(f"[Anime Verification] Error saving verification data: {e}")
+            print(f"[Anime Quiz] Error saving quiz data: {e}")
 
-    def is_user_verified(self, user_id: int) -> bool:
-        """Check if a user is verified (in data)"""
-        return str(user_id) in self.verification_data["verified_users"]
+    def has_passed(self, quiz: dict, user_id: int) -> bool:
+        return str(user_id) in self.data["passed"].get(quiz["key"], [])
 
-    def remove_verified_user(self, user_id: int):
-        """Remove a user from the verified list"""
-        user_id_str = str(user_id)
-        if user_id_str in self.verification_data["verified_users"]:
-            self.verification_data["verified_users"].remove(user_id_str)
-            self.save_verification_data()
+    def record_pass(self, quiz: dict, user_id: int):
+        passed = self.data["passed"].setdefault(quiz["key"], [])
+        if str(user_id) not in passed:
+            passed.append(str(user_id))
+            self.save_data()
 
-    def add_verified_user(self, user_id: int):
-        """Add a user to the verified list"""
-        user_id_str = str(user_id)
-        if user_id_str not in self.verification_data["verified_users"]:
-            self.verification_data["verified_users"].append(user_id_str)
-            self.save_verification_data()
+    # ---------------- helpers ----------------
 
-    async def ensure_verified_role_exists(self, guild: discord.Guild) -> discord.Role:
-        """Ensure the Verified role exists, create if needed"""
-        verified_role = discord.utils.get(guild.roles, name="Verified")
-        if not verified_role:
-            try:
-                verified_role = await guild.create_role(
-                    name="Verified",
-                    color=discord.Color.default(),
-                    reason="Verification system setup"
-                )
-                print(f"[Anime Verification] Created 'Verified' role in guild {guild.name}")
-            except discord.Forbidden:
-                print(f"[Anime Verification] Cannot create 'Verified' role in guild {guild.name} - insufficient permissions")
-                return None
-        return verified_role
-
-    async def send_verification_announcement(self, guild: discord.Guild, member: discord.Member):
-        """Send verification success announcement to the appropriate channel"""
-        # Reload config from disk to pick up any web console changes
-        if hasattr(self.bot, 'reload_config'):
-            self.bot.reload_config()
-
-        guild_config = self.bot.config.get('guilds', {}).get(str(guild.id), {})
-
-        # Use class_announcements_channel, fall back to welcome_channel
-        channel_id = (
-            guild_config.get("class_announcements_channel")
-            or guild_config.get("welcome_channel")
+    @staticmethod
+    def format_message(template: str, quiz: dict, member: discord.Member, issues: str = "") -> str:
+        return template.format(
+            user=member.mention,
+            role=quiz["level"],
+            name=quiz["name"],
+            command=quiz["command"],
+            score=quiz["score"],
+            issues=issues,
         )
 
-        if channel_id:
-            channel = guild.get_channel(int(channel_id))
-            if channel:
-                try:
-                    await channel.send(f"🎉 Welcome to the server, {member.mention}! You've been verified.")
-                except discord.Forbidden:
-                    print(f"[Anime Verification] Cannot send to announcement channel in {guild.name}")
+    def get_announcement_channel(self, guild: discord.Guild):
+        return guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
 
-    async def complete_verification(self, message: discord.Message, member: discord.Member):
-        """Complete the verification process for a user"""
-        try:
-            # Check if already verified
-            if self.is_user_verified(member.id):
-                await message.channel.send(f"{member.mention}, you're already verified!")
-                return
+    def find_quiz_for_command(self, content: str):
+        """Return the quiz a k!q / k!quiz command is for, or None."""
+        parts = content.split()
+        if len(parts) < 2 or parts[0].lower() not in ("k!q", "k!quiz"):
+            return None
+        return self.quizzes_by_decks.get(_normalize_decks(parts[1].split('+')))
 
-            # Ensure role exists
-            verified_role = await self.ensure_verified_role_exists(message.guild)
-            if not verified_role:
-                await message.channel.send("Error: Could not create or find the Verified role.")
-                return
+    def find_quiz_for_report(self, report_data: dict):
+        decks = _normalize_decks(d.get('shortName', '') for d in report_data.get('decks', []))
+        return self.quizzes_by_decks.get(decks)
 
-            # Assign role
-            if verified_role not in member.roles:
-                try:
-                    await member.add_roles(verified_role, reason="Passed verification quiz")
-                except discord.Forbidden:
-                    await message.channel.send("Error: Cannot assign the Verified role - insufficient permissions.")
-                    return
+    @staticmethod
+    def check_requirements(quiz: dict, report_data: dict) -> list:
+        """Return a list of unmet requirements (empty list = passed)."""
+        issues = []
+        scores = report_data.get('scores', [])
+        score = scores[0].get('score', 0) if scores else 0
+        settings = report_data.get('settings', {})
 
-            # Save to data
-            self.add_verified_user(member.id)
+        if score < quiz["score"]:
+            issues.append(f"Score too low: got {score}, need {quiz['score']}")
+        if settings.get('answerTimeLimitInMs', 0) != quiz["time_limit_ms"]:
+            issues.append(f"Wrong time limit: use `atl={quiz['time_limit_ms'] // 1000}`")
+        if settings.get('maxMissedQuestions', 0) != quiz["max_missed"]:
+            issues.append(f"Wrong max missed: use `mmq={quiz['max_missed']}`")
+        # nd = no delay after an answered question (same check the main bot uses)
+        if "nd" in _required_tokens(quiz) and settings.get('newQuestionDelayAfterAnsweredInMs') != 0:
+            issues.append("Missing `nd`")
+        # Kotoba doesn't store font=N in a usable form, so check the command as typed
+        raw_command = report_data.get('rawStartCommand')
+        if raw_command is not None:
+            typed = set(raw_command.lower().split())
+            for token in sorted(t for t in _required_tokens(quiz) if t.startswith("font=")):
+                if token not in typed:
+                    issues.append(f"Missing `{token}`")
+        return issues
 
-            # Send announcement
-            await self.send_verification_announcement(message.guild, member)
-
-            print(f"[Anime Verification] Verified user {member.name} ({member.id}) in {message.guild.name}")
-
-        except Exception as e:
-            print(f"[Anime Verification] Error completing verification for {member.name}: {e}")
+    # ---------------- quiz flow ----------------
 
     async def check_quiz_start(self, message: discord.Message):
-        """Check if a user started the verification quiz"""
-        # Only process messages from actual users, not bots
-        if message.author.bot:
+        if message.author.bot or not message.guild:
+            return
+        quiz = self.find_quiz_for_command(message.content)
+        if not quiz:
             return
 
-        # Parse the quiz command
-        command_parts = message.content.split()
-        if len(command_parts) < 3:
+        role = message.guild.get_role(quiz["role_id"])
+        if not role:
+            return  # a server that doesn't have these roles
+        # Stay quiet if the command is missing settings; the failure message explains later
+        if not _required_tokens(quiz).issubset(message.content.lower().split()[2:]):
             return
 
-        # Check if it matches the verification quiz command pattern: k!quiz ljtakana 8
-        if command_parts[0] != 'k!quiz':
+        if role in message.author.roles:
+            text = ALREADY_HAVE_ROLE_START_MESSAGE
+        else:
+            text = quiz["start_message"]
+        await message.channel.send(self.format_message(text, quiz, message.author))
+
+    async def grant_quiz_role(self, message: discord.Message, quiz: dict, member: discord.Member, role: discord.Role):
+        if role in member.roles:
+            self.record_pass(quiz, member.id)
             return
 
-        deck = command_parts[1] if len(command_parts) > 1 else ""
-        score_target = command_parts[2] if len(command_parts) > 2 else ""
-
-        # Check for ljtakana deck with score 8
-        if deck == 'ljtakana' and score_target == '8':
-            # Check for key parameters
-            has_hardcore = 'hardcore' in command_parts
-            has_nd = 'nd' in command_parts
-            has_mmq4 = any('mmq=4' in part for part in command_parts)
-            has_atl16 = any('atl=16' in part for part in command_parts)
-
-            if has_hardcore and has_nd and has_mmq4 and has_atl16:
-                if self.is_user_verified(message.author.id):
-                    await message.channel.send(
-                        f"🔄 Verification quiz started by {message.author.mention} - **You're already verified!**"
-                    )
-                else:
-                    await message.channel.send(
-                        f"🎯 **VERIFICATION QUIZ** started by {message.author.mention}!\n"
-                        f"**Good luck!** 🍀 Remember: unlimited tries, no cooldown!"
-                    )
-
-    async def check_quiz_failure(self, message: discord.Message, report_data: dict):
-        """Send failure message when ljtakana quiz requirements not met"""
         try:
-            # First check if this is even a ljtakana quiz - only the verification deck gets a response
-            report_decks = {deck.get('shortName', '') for deck in report_data.get('decks', [])}
-            report_decks_lower = {d.lower() for d in report_decks if d}
-            required_decks_lower = {d.lower() for d in self.REQUIRED_DECKS}
+            await member.add_roles(role, reason=f"Passed {quiz['name']}")
+        except discord.Forbidden:
+            await message.channel.send(f"Error: I can't assign the {quiz['level']} role - missing permissions or the role is above mine.")
+            return
 
-            # If it's not a ljtakana quiz, don't respond at all
-            if not report_decks_lower.intersection(required_decks_lower):
-                print(f"[Anime Verification] Not a ljtakana quiz ({report_decks}), ignoring")
-                return
+        self.record_pass(quiz, member.id)
+        await message.channel.send(self.format_message(quiz["success_message"], quiz, member))
 
-            # Get the participant
-            participants = report_data.get('participants', [])
-            if len(participants) != 1:
-                return
+        announce = self.get_announcement_channel(message.guild)
+        if announce and announce.id != message.channel.id:
+            try:
+                await announce.send(self.format_message(quiz["announcement_message"], quiz, member))
+            except discord.Forbidden:
+                print(f"[Anime Quiz] Cannot send to announcement channel in {message.guild.name}")
 
-            user_id = int(participants[0]['discordUser']['id'])
-            member = message.guild.get_member(user_id)
-            if not member:
-                return
+        print(f"[Anime Quiz] {member.name} ({member.id}) passed {quiz['name']} in {message.guild.name}")
 
-            # Already verified?
-            if self.is_user_verified(user_id):
-                return
-
-            # Figure out what went wrong
-            scores = report_data.get('scores', [])
-            score = scores[0].get('score', 0) if scores else 0
-            settings = report_data.get('settings', {})
-
-            issues = []
-            if score < self.REQUIRED_SCORE:
-                issues.append(f"Score too low: got {score}, need {self.REQUIRED_SCORE}")
-            if settings.get('answerTimeLimitInMs', 0) != self.REQUIRED_TIME_LIMIT:
-                issues.append(f"Wrong time limit: use `atl=16`")
-            if settings.get('maxMissedQuestions', 0) != self.REQUIRED_MAX_MISSED:
-                issues.append(f"Wrong max missed: use `mmq=4`")
-
-            if issues:
-                issues_text = "\n".join(f"• {issue}" for issue in issues)
-                await message.channel.send(
-                    f"❌ Verification quiz by {member.mention} didn't meet requirements:\n{issues_text}\n\n"
-                    f"Use `/quiz_verify` to see the correct command."
-                )
-
-        except Exception as e:
-            print(f"[Anime Verification] Error in check_quiz_failure: {e}")
-
-    async def check_quiz_ended_failure(self, message: discord.Message, embed: discord.Embed):
-        """Check if this was an LJTA verification quiz that ended without completion"""
+    async def process_quiz_report(self, message: discord.Message, report_id: str):
         try:
-            embed_title = embed.title or ""
-            embed_text = embed.description or ""
-
-            # Check for quiz ended indicators
-            if "Quiz Ended" not in embed_title and "Game Ended" not in embed_title:
-                return
-
-            # Look for LJTA deck indicators
-            full_text = f"{embed_title} {embed_text}".lower()
-            if "ljta" not in full_text and "ljtakana" not in full_text:
-                return
-
-            # Try to find the user who took the quiz from the embed
-            # Kotoba embeds usually mention the user
-            user_mention_match = re.search(r'<@!?(\d+)>', embed_text)
-            if user_mention_match:
-                user_id = int(user_mention_match.group(1))
-                member = message.guild.get_member(user_id)
-            else:
-                member = None
-
-            if member and not self.is_user_verified(member.id):
-                await message.channel.send(
-                    f"❌ Quiz ended by {member.mention}. Don't give up! You have unlimited tries.\n"
-                    f"Use `/quiz_verify` to see the command again."
-                )
-        except Exception as e:
-            print(f"[Anime Verification] Error in check_quiz_ended_failure: {e}")
-
-    def check_quiz_settings_match(self, report_data: dict) -> bool:
-        """Check if the quiz report matches the required ljtakana settings"""
-        try:
-            print("[Anime Verification] === CHECKING QUIZ SETTINGS ===")
-
-            # Check decks - mirror main bot: get shortName, case-insensitive subset check
-            report_decks = {deck.get('shortName', '') for deck in report_data.get('decks', [])}
-            print(f"[Anime Verification] Report decks: {report_decks}, Required: {self.REQUIRED_DECKS}")
-
-            # Case-insensitive comparison
-            report_decks_lower = {d.lower() for d in report_decks if d}
-            required_decks_lower = {d.lower() for d in self.REQUIRED_DECKS}
-
-            # Check if report decks match required (either direction for single deck)
-            if not report_decks_lower.issubset(required_decks_lower) and not required_decks_lower.issubset(report_decks_lower):
-                print("[Anime Verification] FAILED: Deck mismatch")
-                return False
-
-            # Check score
-            scores = report_data.get('scores', [])
-            if not scores:
-                print("[Anime Verification] FAILED: No scores found")
-                return False
-
-            score = scores[0].get('score', 0)
-            print(f"[Anime Verification] Score: {score}, Required: >= {self.REQUIRED_SCORE}")
-            if score < self.REQUIRED_SCORE:
-                print("[Anime Verification] FAILED: Score too low")
-                return False
-
-            # Check settings
-            settings = report_data.get('settings', {})
-            print(f"[Anime Verification] Settings: {settings}")
-
-            # Check time limit
-            time_limit = settings.get('answerTimeLimitInMs', 0)
-            print(f"[Anime Verification] Time limit: {time_limit}, Required: {self.REQUIRED_TIME_LIMIT}")
-            if time_limit != self.REQUIRED_TIME_LIMIT:
-                print("[Anime Verification] FAILED: Time limit mismatch")
-                return False
-
-            # Check max missed questions
-            max_missed = settings.get('maxMissedQuestions', 0)
-            print(f"[Anime Verification] Max missed: {max_missed}, Required: {self.REQUIRED_MAX_MISSED}")
-            if max_missed != self.REQUIRED_MAX_MISSED:
-                print("[Anime Verification] FAILED: Max missed mismatch")
-                return False
-
-            print("[Anime Verification] === ALL CHECKS PASSED ===")
-            return True
-
-        except Exception as e:
-            print(f"[Anime Verification] Error checking quiz settings: {e}")
-            return False
-
-    async def process_quiz_report(self, message: discord.Message, report_link: str):
-        """Process a quiz report from Kotoba"""
-        try:
-            print(f"[Anime Verification] Processing quiz report: {report_link}")
-
-            # Extract report ID from the link
-            match = re.search(r'game_reports/([^)]*)\)', report_link)
-            if not match:
-                print("[Anime Verification] Failed to extract report ID from link")
-                return
-
-            report_id = match.group(1)
-            print(f"[Anime Verification] Report ID: {report_id}")
-
-            # report_id is interpolated into the URL path, so reject anything outside
-            # the known report-ID charset rather than encoding it.
-            if not re.fullmatch(r'[A-Za-z0-9_-]+', report_id):
-                print("[Anime Verification] Invalid report ID format, skipping fetch")
-                return
-
-            # Fetch the quiz report from Kotoba API (off the event loop, with timeout)
             url = f'https://kotobaweb.com/api/game_reports/{report_id}'
             try:
                 response = await asyncio.to_thread(requests.get, url, timeout=10)
             except requests.RequestException as e:
-                print(f"[Anime Verification] Request to Kotoba failed: {e}")
+                print(f"[Anime Quiz] Request to Kotoba failed: {e}")
                 return
             if response.status_code != 200:
-                print(f"[Anime Verification] Failed to fetch quiz report: {response.status_code}")
+                print(f"[Anime Quiz] Failed to fetch quiz report: {response.status_code}")
                 return
-
             report_data = response.json()
-            print("[Anime Verification] Successfully fetched quiz report")
 
-            # Check single participant
+            quiz = self.find_quiz_for_report(report_data)
+            if not quiz:
+                return  # not one of our quizzes
+
+            role = message.guild.get_role(quiz["role_id"])
+            if not role:
+                return  # a server that doesn't have these roles
+
             participants = report_data.get('participants', [])
             if len(participants) != 1:
-                print("[Anime Verification] Quiz has multiple participants, skipping")
+                print("[Anime Quiz] Quiz has multiple participants, skipping")
                 return
 
-            # Get user who took the quiz
-            user_id = int(participants[0]['discordUser']['id'])
-            member = message.guild.get_member(user_id)
+            member = message.guild.get_member(int(participants[0]['discordUser']['id']))
             if not member:
-                print(f"[Anime Verification] Member {user_id} not found in guild")
                 return
 
-            print(f"[Anime Verification] Quiz taker: {member.name}")
-
-            # Check if settings match
-            if not self.check_quiz_settings_match(report_data):
-                print("[Anime Verification] Quiz settings don't match requirements")
-                await self.check_quiz_failure(message, report_data)
+            issues = self.check_requirements(quiz, report_data)
+            if issues:
+                if role in member.roles:
+                    return  # already has it, no need to nag
+                issues_text = "\n".join(f"• {i}" for i in issues)
+                await message.channel.send(self.format_message(quiz["failure_message"], quiz, member, issues_text))
                 return
 
-            # Complete verification
-            await self.complete_verification(message, member)
+            await self.grant_quiz_role(message, quiz, member, role)
 
         except Exception as e:
-            print(f"[Anime Verification] Error processing quiz report: {e}")
+            print(f"[Anime Quiz] Error processing quiz report: {e}")
             import traceback
             traceback.print_exc()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Monitor for Kotoba quiz starts and completions"""
-        # Check for quiz start commands from users (not Kotoba)
-        if message.author.id != self.KOTOBA_ID and message.content.startswith('k!quiz'):
-            await self.check_quiz_start(message)
-            return
-
-        # Only process other messages from Kotoba bot
         if message.author.id != self.KOTOBA_ID:
+            if message.content.lower().startswith('k!q'):
+                await self.check_quiz_start(message)
             return
 
-        # Check for embeds
-        if not message.embeds:
+        if not message.embeds or not message.guild:
             return
 
-        # Look for "View a report" links in embed fields and description
-        report_links = []
-        quiz_ended_embed = None
+        # Collect report IDs from embed descriptions and fields (each ID once)
+        report_ids = []
         for embed in message.embeds:
-            embed_title = embed.title or ""
+            texts = [embed.description or ""] + [field.value or "" for field in embed.fields]
+            for text in texts:
+                for report_id in re.findall(r'game_reports/([A-Za-z0-9_-]+)', text):
+                    if report_id not in report_ids:
+                        report_ids.append(report_id)
 
-            # Track if this is a Quiz Ended embed
-            if "Quiz Ended" in embed_title or "Game Ended" in embed_title:
-                quiz_ended_embed = embed
-
-            # Check embed description for report links
-            if embed.description and 'View a report' in embed.description:
-                for line in embed.description.split('\n'):
-                    if 'View a report' in line:
-                        report_links.append(line)
-                        print(f"[Anime Verification] Found report link in description: {line}")
-
-            # Check embed fields
-            for field in embed.fields:
-                if 'View a report' in (field.value or ''):
-                    report_links.append(field.value)
-                    print(f"[Anime Verification] Found report link in field: {field.value}")
-                elif 'game_reports' in (field.value or ''):
-                    report_links.append(field.value)
-                    print(f"[Anime Verification] Found report link (alt): {field.value}")
-
-        # When report links are present, process them (success or failure determined by report)
-        if report_links:
-            for link in report_links:
-                await self.process_quiz_report(message, link)
-            return
-
-        # No report links - if this was a Quiz Ended embed, it's a failure/stop
-        if quiz_ended_embed:
-            await self.check_quiz_ended_failure(message, quiz_ended_embed)
-
-    async def get_user_anime_class_info(self, member: discord.Member):
-        """Get user's anime class information for welcome message"""
-        try:
-            immersion_cog = self.bot.get_cog("ImmersionCog")
-            if not immersion_cog:
-                return None
-
-            # Get anime hours
-            user_id = str(member.id)
-            anime_seconds = await immersion_cog.activity_repo.sum_activity_duration(
-                user_id,
-                media_type="anime"
-            )
-            anime_hours = (anime_seconds or 0) / 3600
-
-            # Use anime class definitions
-            from cogs.immersion import ANIME_CLASS_ROLE_DEFINITIONS
-
-            # Find current class
-            current_class = "人間"  # Default base class
-            for definition in ANIME_CLASS_ROLE_DEFINITIONS:
-                if anime_hours >= definition["min_hours"]:
-                    current_class = definition["name"]
-
-            return {
-                "class_name": current_class,
-                "anime_hours": anime_hours
-            }
-        except Exception as e:
-            print(f"[Anime Verification] Error getting anime class info for {member.name}: {e}")
-            return None
+        for report_id in report_ids:
+            await self.process_quiz_report(message, report_id)
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        """Restore Verified role for returning verified users"""
+        """Give returning members back the quiz roles they already earned."""
         if member.bot:
             return
-
-        # Reload config from disk to pick up any web console changes
-        if hasattr(self.bot, 'reload_config'):
-            self.bot.reload_config()
-
-        if self.is_user_verified(member.id):
-            verified_role = discord.utils.get(member.guild.roles, name="Verified")
-            if verified_role and verified_role not in member.roles:
-                try:
-                    await member.add_roles(verified_role, reason="Restored verification on rejoin")
-                    print(f"[Anime Verification] Restored 'Verified' role to returning user {member.name}")
-                except discord.Forbidden:
-                    print(f"[Anime Verification] Cannot restore 'Verified' role to {member.name}")
-                    return
-
-            # Get anime class info
-            class_info = await self.get_user_anime_class_info(member)
-
-            # Send welcome back message to class announcements channel
-            guild_id = str(member.guild.id)
-            guild_config = self.bot.config.get('guilds', {}).get(guild_id, {})
-            # Use class_announcements_channel (same as class change announcements)
-            channel_id = guild_config.get('class_announcements_channel') or guild_config.get('welcome_channel')
-
-            if channel_id:
-                welcome_channel = member.guild.get_channel(int(channel_id))
-                if welcome_channel:
-                    try:
-                        welcome_parts = [f"🔄 Welcome back, {member.mention}!"]
-                        welcome_parts.append("Your **Verified** role has been restored.")
-
-                        if class_info:
-                            welcome_parts.append(f"Your **{class_info['class_name']}** class role has been restored ({class_info['anime_hours']:.1f}h anime time).")
-
-                        welcome_back_text = " ".join(welcome_parts)
-                        await welcome_channel.send(welcome_back_text)
-                    except discord.Forbidden:
-                        pass
-                    except Exception as e:
-                        print(f"[Anime Verification] Error sending welcome back message: {e}")
+        roles = []
+        for quiz in QUIZZES:
+            if self.has_passed(quiz, member.id):
+                role = member.guild.get_role(quiz["role_id"])
+                if role and role not in member.roles:
+                    roles.append(role)
+        if roles:
+            try:
+                await member.add_roles(*roles, reason="Restored quiz roles on rejoin")
+                print(f"[Anime Quiz] Restored {len(roles)} quiz role(s) to {member.name}")
+            except discord.Forbidden:
+                print(f"[Anime Quiz] Cannot restore quiz roles to {member.name}")
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """Track when Verified role is manually added or removed"""
-        # Check if roles actually changed
+        """Keep the saved data in step with roles a moderator adds or removes by hand."""
         if before.roles == after.roles:
             return
+        changed = False
+        for quiz in QUIZZES:
+            role = after.guild.get_role(quiz["role_id"])
+            if not role:
+                continue
+            had, has = role in before.roles, role in after.roles
+            passed = self.data["passed"].setdefault(quiz["key"], [])
+            user_id = str(after.id)
+            if has and not had and user_id not in passed:
+                passed.append(user_id)
+                changed = True
+            elif had and not has and user_id in passed:
+                passed.remove(user_id)
+                changed = True
+        if changed:
+            self.save_data()
 
-        verified_role = discord.utils.get(after.guild.roles, name="Verified")
-        if not verified_role:
-            return
+    # ---------------- slash commands ----------------
 
-        had_verified = verified_role in before.roles
-        has_verified = verified_role in after.roles
-        is_in_data = self.is_user_verified(after.id)
-
-        if has_verified and not had_verified and not is_in_data:
-            # Gained Verified role manually - add to data
-            self.add_verified_user(after.id)
-            print(f"[Anime Verification] Auto-added {after.name} to verified list (gained Verified role)")
-        elif not has_verified and had_verified and is_in_data:
-            # Lost Verified role manually - remove from data
-            self.remove_verified_user(after.id)
-            print(f"[Anime Verification] Auto-removed {after.name} from verified list (lost Verified role)")
-
-    @app_commands.command(name="quiz_verify", description="Show how to get verified")
-    async def quiz_verify(self, interaction: discord.Interaction):
-        """Show verification instructions"""
+    @app_commands.command(name="quizzes", description="Show the level quizzes and the roles they give")
+    async def quizzes(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="How to Get Verified",
-            description="Complete a hiragana quiz to verify and get server access!",
-            color=discord.Color.blue()
-        )
-        embed.add_field(
-            name="Quiz Command",
-            value=f"```{self.QUIZ_COMMAND}```",
-            inline=False
-        )
-        embed.add_field(
-            name="Requirements",
-            value=(
-                "• **Score**: Reach 8 points\n"
-                "• **Max missed**: 4 questions\n"
-                "• **Time limit**: 16 seconds per question\n"
-                "• **Deck**: Hiragana"
+            title="📚 Level Quizzes",
+            description=(
+                "Pass a Kotoba quiz to earn its level role!\n"
+                "Copy a command below exactly as it is. Unlimited tries, no cooldown."
             ),
-            inline=False
+            color=discord.Color.blue(),
         )
-        embed.add_field(
-            name="What happens",
-            value=(
-                "1. Copy and paste the quiz command above\n"
-                "2. Complete the quiz and reach 8 points\n"
-                "3. You'll automatically get the **Verified** role\n"
-                "4. Enjoy full server access!"
-            ),
-            inline=False
-        )
-
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="quiz_progress", description="Check your verification status")
-    async def quiz_progress(self, interaction: discord.Interaction, user: discord.Member = None):
-        """Show verification status"""
-        if user is None:
-            user = interaction.user
-
-        is_verified = self.is_user_verified(user.id)
-        verified_role = discord.utils.get(interaction.guild.roles, name="Verified")
-        has_role = verified_role in user.roles if verified_role else False
-
-        if is_verified or has_role:
-            embed = discord.Embed(
-                title=f"✅ Verification Status - {user.display_name}",
-                description="You are verified!",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Status", value="Verified", inline=True)
-        else:
-            embed = discord.Embed(
-                title=f"❓ Verification Status - {user.display_name}",
-                description="You are not yet verified.",
-                color=discord.Color.orange()
-            )
-            embed.add_field(name="Status", value="Not Verified", inline=True)
+        for quiz in QUIZZES:
             embed.add_field(
-                name="How to Verify",
-                value=f"Use `/quiz_verify` to see the verification quiz command.",
-                inline=False
+                name=f"{quiz['emoji']} {quiz['name']}",
+                value=(
+                    f"{quiz['description']}\n"
+                    f"Role: {quiz['level']} • Score: {quiz['score']} • "
+                    f"{quiz['time_limit_ms'] // 1000}s per question • max {quiz['max_missed']} missed\n"
+                    f"```{quiz['command']}```"
+                ),
+                inline=False,
             )
-
         await interaction.response.send_message(embed=embed)
 
 
