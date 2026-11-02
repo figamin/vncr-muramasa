@@ -3,8 +3,9 @@ LJTA (Learn Japanese Through Anime) - Anime Consequences Cog
 Monthly penalty and reward roles based on logged anime time.
 
 - On the 1st of each month, members who logged under 4 hours of anime in the
-  month that just ended get the penalty role and a DM. Logging 1 hour of anime
-  after that removes the role.
+  month that just ended get the penalty role, one person per second. Once they
+  all have it, one message (with the image) pings the role in the penalty
+  channel. No DMs are sent. Logging 1 hour of anime removes the role.
 - Logging 15+ hours of anime in a month gives the reward role and an
   announcement. It makes you immune to the penalty and is removed on the 1st of
   the second month after you earned it (earned in October -> removed 1 December).
@@ -42,9 +43,10 @@ RELEASE_HOURS = 1             # logging this much after the penalty -> role remo
 REWARD_THRESHOLD_HOURS = 15   # logging this much in a month -> reward role
 LATE_JOIN_DAY = 15            # joined after this day of a month -> not judged that month
 
-# {channel} becomes a clickable link to the penalty channel.
-PENALTY_DM = (
-    "Oh no! It looks you haven't been logging any anime and as punishment have been locked in "
+# Posted once in the penalty channel after everyone for the month has the role,
+# with the image. {role} pings the penalty role; {channel} links the penalty channel.
+PENALTY_MESSAGE = (
+    "{role} Oh no! It looks you haven't been logging any anime and as punishment have been locked in "
     "{channel} ! You must log some anime using the /log_anime command to regain access to the "
     "rest of the server!"
 )
@@ -54,7 +56,10 @@ PENALTY_IMAGE = Path(__file__).parent.parent / "assets" / "consequences" / "psyc
 REWARD_ANNOUNCEMENT = "{user} got a 💮 for logging over 15 hours of anime this month!"
 
 CHECK_INTERVAL_MINUTES = 10   # how often the background check runs
-DM_PACING_SECONDS = 1         # pause between penalty DMs at month end
+
+# Month-end penalty roles go out one person at a time. ~400 people at 1 per second
+# takes about 7 minutes; the penalty channel message is posted after the last one.
+PENALTY_ROLE_INTERVAL_SECONDS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +112,11 @@ class ConsequencesCog(commands.Cog):
 
     async def cog_load(self):
         self.monthly_check.start()
+        self.penalty_sender.start()
 
     async def cog_unload(self):
         self.monthly_check.cancel()
+        self.penalty_sender.cancel()
 
     # ---------------- saved data ----------------
     #
@@ -122,6 +129,10 @@ class ConsequencesCog(commands.Cog):
     #   reward_months  - {user_id: last month a reward was given}, so it is given at most
     #                    once a month even if the role is removed (by a mod or the expiry test)
     #   first_joined   - {user_id: first join time seen by the bot}
+    #   penalty_queue  - {"month": judged month, "users": [user_id, ...] still to penalize,
+    #                    "given": how many got the role, "announced": message posted?}
+    #   penalty_months - {user_id: month they were last penalized for}, so nobody is
+    #                    penalized twice for the same month
 
     def load_data(self) -> dict:
         if self.data_file.exists():
@@ -154,7 +165,7 @@ class ConsequencesCog(commands.Cog):
                 "last_rollover": current,
             }
             self.data["guilds"][str(guild.id)] = state
-        for key in ("penalized", "rewards", "reward_months", "first_joined"):
+        for key in ("penalized", "rewards", "reward_months", "first_joined", "penalty_queue", "penalty_months"):
             state.setdefault(key, {})
         return state
 
@@ -235,24 +246,29 @@ class ConsequencesCog(commands.Cog):
             return discord.File(PENALTY_IMAGE, filename=PENALTY_IMAGE.name)
         return None
 
-    async def send_penalty_dm(self, member: discord.Member) -> bool:
-        """DM the penalty message. Falls back to the penalty channel if DMs are closed."""
-        text = PENALTY_DM.format(channel=f"<#{PENALTY_CHANNEL_ID}>")
+    async def post_penalty_message(self, guild: discord.Guild, test_member: Optional[discord.Member] = None) -> Optional[str]:
+        """Post the penalty message with the image in the penalty channel, pinging the
+        penalty role. For an admin test, it pings only that admin instead of the role.
+        Returns an error message on failure."""
+        channel = guild.get_channel(PENALTY_CHANNEL_ID)
+        role = guild.get_role(PENALTY_ROLE_ID)
+        if channel is None or role is None:
+            return "the penalty channel or role doesn't exist"
+        text = PENALTY_MESSAGE.format(role=role.mention, channel=f"<#{PENALTY_CHANNEL_ID}>")
+        if test_member is None:
+            mentions = discord.AllowedMentions(everyone=False, users=False, roles=[role])
+        else:
+            text = f"{test_member.mention} (test, the role isn't pinged) {text}"
+            mentions = discord.AllowedMentions(everyone=False, roles=False, users=[test_member])
         try:
-            await member.send(text, file=self.penalty_file())
-            return True
+            await channel.send(text, file=self.penalty_file(), allowed_mentions=mentions)
         except discord.HTTPException as e:
-            logger.info(f"[Consequences] Can't DM {member} ({e}); posting in the penalty channel instead")
-        channel = member.guild.get_channel(PENALTY_CHANNEL_ID)
-        if channel:
-            try:
-                await channel.send(f"{member.mention} {text}", file=self.penalty_file())
-            except discord.HTTPException as e:
-                logger.warning(f"[Consequences] Can't post in the penalty channel: {e}")
-        return False
+            logger.error(f"[Consequences] Can't post the penalty message: {e}")
+            return f"I couldn't post in the penalty channel ({e})."
+        return None
 
-    async def penalize(self, state: dict, member: discord.Member, reason: str) -> Optional[str]:
-        """Give the penalty role and send the DM. Returns an error message on failure."""
+    async def give_penalty_role(self, state: dict, member: discord.Member, reason: str) -> Optional[str]:
+        """Give the penalty role and record it. Returns an error message on failure."""
         role = member.guild.get_role(PENALTY_ROLE_ID)
         if role is None:
             return "the penalty role doesn't exist"
@@ -263,7 +279,6 @@ class ConsequencesCog(commands.Cog):
             return f"I couldn't give the penalty role ({e}). Check my role is above it and I have Manage Roles."
         state["penalized"][str(member.id)] = db_timestamp(now_utc())
         self.save_data()
-        await self.send_penalty_dm(member)
         logger.info(f"[Consequences] Penalized {member} ({member.id}): {reason}")
         return None
 
@@ -360,27 +375,88 @@ class ConsequencesCog(commands.Cog):
                 continue
             await self.grant_reward(state, member, month)
 
+    def penalty_skip_reason(self, state: dict, member: Optional[discord.Member], month: str,
+                            totals: Dict[str, int]) -> Optional[str]:
+        """Why this member shouldn't get the penalty for `month`, or None."""
+        if member is None:
+            return "left the server"
+        if member.bot:
+            return "bot"
+        role = member.guild.get_role(PENALTY_ROLE_ID)
+        if role in member.roles:
+            return "already has the penalty role"
+        if state["penalty_months"].get(str(member.id)) == month:
+            return "already penalized for this month"
+        if self.immunity_reason(state, member, month):
+            return "immune"
+        if totals.get(str(member.id), 0) >= PENALTY_THRESHOLD_HOURS * 3600:
+            return "logged enough"
+        return None
+
     async def judge_month(self, guild: discord.Guild, state: dict, month: str):
-        """Month-end: penalize members who logged too little in `month`."""
+        """Month-end: queue the members who logged too little in `month`.
+        penalty_sender then gives the role one person at a time, and posts the
+        penalty channel message once everyone has it."""
         totals = await self.anime_seconds_in_month(month)
         if not guild.chunked:
             await guild.chunk(cache=True)
-        role = guild.get_role(PENALTY_ROLE_ID)
-        count = 0
-        for member in list(guild.members):
-            if member.bot or role in member.roles:
+        queue = [
+            str(member.id) for member in guild.members
+            if self.penalty_skip_reason(state, member, month, totals) is None
+        ]
+        # A new month's batch replaces anything left over
+        state["penalty_queue"] = {"month": month, "users": queue, "given": 0, "announced": False}
+        self.save_data()
+        logger.info(f"[Consequences] {guild.name}: judged {month}, queued {len(queue)} member(s)")
+
+    async def send_next_penalty(self, guild: discord.Guild, state: dict):
+        """Give the penalty role to the next person in the queue (one per call).
+        When the queue is done, post the penalty channel message once."""
+        if not state["enabled"]:
+            return  # turning the system off also pauses the queue
+        queue = state["penalty_queue"]
+        month = queue.get("month")
+        users = queue.get("users") or []
+
+        if not users:
+            if queue.get("given") and not queue.get("announced"):
+                # Marked first, so a crash or restart can never post it twice
+                queue["announced"] = True
+                self.save_data()
+                await self.post_penalty_message(guild)
+                logger.info(f"[Consequences] {guild.name}: posted the penalty message for {month} ({queue['given']} people)")
+            return
+
+        while users:
+            user_id = users.pop(0)
+            member = guild.get_member(int(user_id))
+            # Re-check: they may have left, been released, backdated logs into the month, etc.
+            totals = await self.anime_seconds_in_month(month, user_id)
+            if self.penalty_skip_reason(state, member, month, totals) is not None:
+                self.save_data()
                 continue
-            if self.immunity_reason(state, member, month):
-                continue
-            if totals.get(str(member.id), 0) >= PENALTY_THRESHOLD_HOURS * 3600:
-                continue
-            error = await self.penalize(
+            error = await self.give_penalty_role(
                 state, member, f"Logged under {PENALTY_THRESHOLD_HOURS}h of anime in {month}"
             )
             if error is None:
-                count += 1
-                await asyncio.sleep(DM_PACING_SECONDS)
-        logger.info(f"[Consequences] {guild.name}: judged {month}, penalized {count} member(s)")
+                state["penalty_months"][user_id] = month
+                queue["given"] = queue.get("given", 0) + 1
+            self.save_data()
+            return
+
+    @tasks.loop(seconds=PENALTY_ROLE_INTERVAL_SECONDS)
+    async def penalty_sender(self):
+        for guild in self.target_guilds():
+            try:
+                state = self.guild_state(guild)
+                async with self.lock:
+                    await self.send_next_penalty(guild, state)
+            except Exception as e:
+                logger.exception(f"[Consequences] Penalty sender failed in {guild.name}: {e}")
+
+    @penalty_sender.before_loop
+    async def before_penalty_sender(self):
+        await self.bot.wait_until_ready()
 
     async def rollover(self, guild: discord.Guild, state: dict):
         """Runs once when a new month starts: judge last month, then expire rewards."""
@@ -557,9 +633,27 @@ class ConsequencesCog(commands.Cog):
         embed.add_field(name="First month judged", value=month_name(state["first_month"]), inline=True)
         embed.add_field(name="Penalized now", value=str(len(state["penalized"])), inline=True)
         embed.add_field(name="Reward holders", value=str(len(state["rewards"])), inline=True)
+
+        queue = state["penalty_queue"]
+        waiting = len(queue.get("users") or [])
+        if waiting:
+            done_at = now_utc().timestamp() + waiting * PENALTY_ROLE_INTERVAL_SECONDS
+            queue_text = (
+                f"{waiting} people still to get the penalty role, one every "
+                f"{PENALTY_ROLE_INTERVAL_SECONDS}s (done around <t:{int(done_at)}:t>). "
+                "The penalty channel message is posted after the last one."
+            )
+        elif queue.get("month"):
+            queue_text = (
+                f"{month_name(queue['month'])}: {queue.get('given', 0)} penalized; penalty channel message "
+                + ("posted." if queue.get("announced") else "not needed (nobody penalized)." if not queue.get("given") else "about to be posted.")
+            )
+        else:
+            queue_text = "Nothing yet"
+        embed.add_field(name="Month-end penalty queue", value=queue_text, inline=False)
         embed.set_footer(text=(
-            "While off: no new penalties or rewards. People who already have the penalty "
-            "can still remove it by logging, and reward roles still expire."
+            "While off: no new penalties or rewards, and the penalty queue pauses. People who already "
+            "have the penalty can still remove it by logging, and reward roles still expire."
         ))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -602,10 +696,15 @@ class ConsequencesCog(commands.Cog):
                 elif seconds >= PENALTY_THRESHOLD_HOURS * 3600:
                     reply = f"✅ Safe: you've logged {hours(seconds)} of anime this month (the minimum is {PENALTY_THRESHOLD_HOURS}h)."
                 else:
-                    error = await self.penalize(state, member, "Penalty test by an admin")
+                    # Same role and message as the month-end run, but the message pings only
+                    # this admin, not the role. Not counted towards the once-a-month rule.
+                    error = await self.give_penalty_role(state, member, "Penalty test by an admin")
+                    if not error:
+                        error = await self.post_penalty_message(guild, test_member=member)
                     reply = error or (
                         f"You've logged {hours(seconds)} this month, under {PENALTY_THRESHOLD_HOURS}h, so you got "
-                        f"the penalty role and the DM. Log {RELEASE_HOURS}h of anime to remove it."
+                        f"the penalty role, and the penalty channel message was posted pinging only you. "
+                        f"Log {RELEASE_HOURS}h of anime to remove it."
                     )
 
             elif choice == "release":
