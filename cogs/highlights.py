@@ -49,6 +49,9 @@ class HighlightsCog(commands.Cog):
         self._permission_warnings: Set[int] = set()
         # One-time backfill task and the lock that keeps scans from overlapping.
         self._backfill_task: Optional[asyncio.Task] = None
+        # Manual scans started from /manage_highlights. Kept referenced so they are
+        # not garbage-collected while running.
+        self._backfill_tasks: Set[asyncio.Task] = set()
         self._backfill_lock = asyncio.Lock()
         # Load previously highlighted messages from file
         self._load_highlighted_messages()
@@ -81,6 +84,9 @@ class HighlightsCog(commands.Cog):
     async def cog_unload(self):
         if self._backfill_task and not self._backfill_task.done():
             self._backfill_task.cancel()
+        for task in list(self._backfill_tasks):
+            if not task.done():
+                task.cancel()
 
 
     def _load_highlighted_messages(self):
@@ -893,31 +899,73 @@ class HighlightsCog(commands.Cog):
             logger.exception("Highlights backfill: one-time scan failed")
 
     async def _highlights_backfill(self, interaction: discord.Interaction):
-        """Manually re-run the repair scan for this guild."""
+        """Manually re-run the repair scan for this guild.
+
+        The scan can easily outlive Discord's 15-minute interaction token (it reads
+        up to MESSAGE_MAX_AGE_DAYS of history), so it runs as a background task.
+        The invocation is acknowledged immediately and the summary is delivered when
+        the scan finishes, falling back to a normal channel message if the token has
+        expired by then.
+        """
         await interaction.response.defer(ephemeral=True)
-        results = await self._backfill_missed_highlights(force=True, guild=interaction.guild)
+
+        if self._backfill_lock.locked():
+            await self._send_followup_safe(
+                interaction,
+                "⏳ A backfill scan is already running. Try again when it finishes.",
+            )
+            return
+
+        await self._send_followup_safe(
+            interaction,
+            "🧹 Backfill scan started. It reads up to "
+            f"{self.MESSAGE_MAX_AGE_DAYS} days of history, so it can take a while. "
+            "The summary will be posted when it finishes.",
+        )
+
+        task = asyncio.create_task(
+            self._run_manual_backfill(interaction),
+            name=f"highlights-backfill-{interaction.guild_id}",
+        )
+        self._backfill_tasks.add(task)
+        task.add_done_callback(self._backfill_tasks.discard)
+
+    async def _run_manual_backfill(self, interaction: discord.Interaction):
+        """Run the manual scan and deliver its summary, even if the token expired."""
+        try:
+            results = await self._backfill_missed_highlights(
+                force=True, guild=interaction.guild
+            )
+        except Exception:
+            logger.exception("Highlights backfill: manual scan failed")
+            results = None
 
         if results is None:
-            await interaction.followup.send(
-                "⏳ A backfill scan is already running. Try again in a moment.",
-                ephemeral=True,
+            embed = discord.Embed(
+                title="🧹 Highlight backfill",
+                description="Another scan started first; nothing was done.",
+                color=discord.Color.orange(),
             )
-            return
-        if not results:
-            await interaction.followup.send(
-                "ℹ️ Nothing to scan for this server.",
-                ephemeral=True,
+        elif not results:
+            embed = discord.Embed(
+                title="🧹 Highlight backfill",
+                description="Nothing to scan for this server.",
+                color=discord.Color.orange(),
             )
-            return
+        else:
+            stats = results[0]
+            if stats.get('error'):
+                embed = discord.Embed(
+                    title="🧹 Highlight backfill failed",
+                    description=f"❌ {stats['error']}",
+                    color=discord.Color.red(),
+                )
+            else:
+                embed = self._build_backfill_report(interaction, stats)
 
-        stats = results[0]
-        if stats.get('error'):
-            await interaction.followup.send(
-                f"❌ Backfill could not run: {stats['error']}",
-                ephemeral=True,
-            )
-            return
+        await self._deliver_backfill_report(interaction, embed)
 
+    def _build_backfill_report(self, interaction: discord.Interaction, stats: dict) -> discord.Embed:
         lines = [
             f"Channels scanned: **{stats['channels_scanned']}**",
             f"Messages scanned: **{stats['messages_scanned']}**",
@@ -936,14 +984,51 @@ class HighlightsCog(commands.Cog):
                 "repair posts; enable live highlighting with "
                 "`/manage_highlights setup enabled:true`."
             )
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="🧹 Highlight backfill complete",
-                description="\n".join(lines),
-                color=discord.Color.green(),
-            ),
-            ephemeral=True,
+        return discord.Embed(
+            title="🧹 Highlight backfill complete",
+            description="\n".join(lines),
+            color=discord.Color.green(),
         )
+
+    async def _deliver_backfill_report(self, interaction: discord.Interaction, embed: discord.Embed):
+        """Deliver the summary without raising if the interaction token has expired."""
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        except (discord.NotFound, discord.HTTPException) as exc:
+            # 50027 "Invalid Webhook Token" means the 15-minute window closed while
+            # a long scan was running. That is expected, not a command failure.
+            logger.warning(
+                "Highlights backfill: interaction token no longer usable (%s); "
+                "posting the summary in the channel instead", exc,
+            )
+        except Exception:
+            logger.exception("Highlights backfill: could not deliver the summary")
+
+        channel = interaction.channel
+        if channel is not None:
+            try:
+                await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            except Exception:
+                logger.exception("Highlights backfill: could not post the summary in the channel")
+
+        logger.info(
+            "Highlights backfill summary (guild %s): %s",
+            getattr(interaction, 'guild_id', '?'),
+            getattr(embed, 'description', ''),
+        )
+
+    @staticmethod
+    async def _send_followup_safe(interaction: discord.Interaction, content: str):
+        """Best-effort interaction reply; an expired token is logged, not raised."""
+        try:
+            await interaction.followup.send(content, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException) as exc:
+            logger.warning("Highlights: could not reply to the interaction: %s", exc)
     
     @app_commands.command(name="manage_highlights", description="[ADMIN] Configure, view, test or repair the highlights feature")
     @app_commands.describe(
