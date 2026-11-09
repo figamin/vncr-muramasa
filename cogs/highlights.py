@@ -407,8 +407,12 @@ class HighlightsCog(commands.Cog):
         perms = channel.permissions_for(guild.me)
         return [label for label, attr in required if not getattr(perms, attr, False)]
 
-    async def _check_and_highlight_message(self, message: discord.Message):
-        """Check if a message should be highlighted and post it if so"""
+    async def _check_and_highlight_message(self, message: discord.Message, ignore_enabled: bool = False):
+        """Check if a message should be highlighted and post it if so.
+
+        ``ignore_enabled`` is used by the repair scan: an admin explicitly asked
+        for a backfill, even though live highlighting may still be switched off.
+        """
         # Use a lock for this specific message to prevent race conditions
         async with self._get_message_lock(message.id):
             try:
@@ -417,7 +421,7 @@ class HighlightsCog(commands.Cog):
                     return
 
                 # Check if highlights is enabled
-                if not self._is_highlights_enabled(guild.id):
+                if not ignore_enabled and not self._is_highlights_enabled(guild.id):
                     logger.debug("Highlights: disabled for guild %s", guild.id)
                     return
 
@@ -689,7 +693,7 @@ class HighlightsCog(commands.Cog):
             )
         return found
 
-    async def _backfill_guild(self, guild: discord.Guild) -> dict:
+    async def _backfill_guild(self, guild: discord.Guild, ignore_enabled: bool = False) -> dict:
         """Scan a guild's recent messages and post any highlight that was missed."""
         stats = {
             'guild_id': guild.id,
@@ -790,7 +794,9 @@ class HighlightsCog(commands.Cog):
                         continue
 
                     stats['candidates'] += 1
-                    await self._check_and_highlight_message(message)
+                    await self._check_and_highlight_message(
+                        message, ignore_enabled=ignore_enabled
+                    )
                     if message.id in self.highlighted_messages:
                         stats['posted'] += 1
             except (discord.Forbidden, discord.HTTPException):
@@ -821,8 +827,11 @@ class HighlightsCog(commands.Cog):
         """Repair highlights that were missed while the bot was not working.
 
         Runs at most once per guild, tracked in BACKFILL_MARKER_FILE. ``force``
-        (used by /manage_highlights backfill) scans the guild again. Returns None
-        if a scan is already running, otherwise the per-guild result dicts.
+        (used by /manage_highlights backfill) scans the guild again. A manual run
+        ignores the ``highlights_enabled`` flag: that flag also gates live posting,
+        so it may be the very thing that was broken, and an admin asking for a
+        backfill clearly wants the repair. Returns None if a scan is already
+        running, otherwise the per-guild result dicts.
         """
         if self._backfill_lock.locked():
             logger.info("Highlights backfill: a scan is already running; skipping")
@@ -833,10 +842,24 @@ class HighlightsCog(commands.Cog):
             state = self._load_backfill_state()
             completed = state.setdefault('completed_guilds', {})
             targets = [guild] if guild is not None else list(self.bot.guilds)
+            manual = force or guild is not None
 
             for target in targets:
-                if target is None or not self._is_highlights_enabled(target.id):
+                if target is None:
                     continue
+
+                if not manual:
+                    # The automatic startup scan only runs where highlights are
+                    # actually in use.
+                    if not self._is_highlights_enabled(target.id):
+                        logger.debug(
+                            "Highlights backfill: feature disabled for guild %s; skipping",
+                            target.id,
+                        )
+                        continue
+                    if self._get_highlights_channel_id(target.id) is None:
+                        continue
+
                 if not force and str(target.id) in completed:
                     logger.debug(
                         "Highlights backfill: guild %s already repaired, skipping", target.id
@@ -846,7 +869,7 @@ class HighlightsCog(commands.Cog):
                 logger.info(
                     "Highlights backfill: scanning guild %s (%s)", target.id, target.name
                 )
-                stats = await self._backfill_guild(target)
+                stats = await self._backfill_guild(target, ignore_enabled=manual)
                 results.append(stats)
 
                 if stats.get('error'):
@@ -882,7 +905,7 @@ class HighlightsCog(commands.Cog):
             return
         if not results:
             await interaction.followup.send(
-                "ℹ️ Highlights are not enabled for this server, so there is nothing to scan.",
+                "ℹ️ Nothing to scan for this server.",
                 ephemeral=True,
             )
             return
@@ -906,6 +929,12 @@ class HighlightsCog(commands.Cog):
             lines.append(
                 "Skipped channels (no access): "
                 + ", ".join(f"`{name}`" for name in skipped)
+            )
+        if not self._is_highlights_enabled(interaction.guild.id):
+            lines.append(
+                "⚠️ **Live highlights are currently disabled.** These were one-time "
+                "repair posts; enable live highlighting with "
+                "`/manage_highlights setup enabled:true`."
             )
         await interaction.followup.send(
             embed=discord.Embed(
