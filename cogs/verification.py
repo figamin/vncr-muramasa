@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import discord.app_commands
 import json
+import logging
 import os
 import re
 import requests
@@ -13,6 +14,9 @@ from typing import Dict, Optional, List, Any
 from pathlib import Path
 
 from utils.backup_schedule import BACKUP_INTERVAL_HOURS, BACKUP_RUN_TIMES, next_backup_run_after
+
+logger = logging.getLogger(__name__)
+
 
 class VerificationCog(commands.Cog):
     def __init__(self, bot):
@@ -1606,37 +1610,115 @@ class VerificationCog(commands.Cog):
             elif level == 15:
                 # Max level reached
                 embed.add_field(name="🏆 Maximum Level", value="Congratulations! You've completed all 15 levels!", inline=False)
-            
-            await message.channel.send(embed=embed)
-            
+
+            # The result embed, the welcome announcement and the DM are independent:
+            # a missing permission in the quiz channel must not silence the other
+            # two. They used to share one try block, so the first failure skipped
+            # the level-up announcement entirely.
+            try:
+                await message.channel.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Verification: could not post the Level %s result embed in #%s (guild %s)",
+                    level,
+                    getattr(message.channel, 'name', getattr(message.channel, 'id', '?')),
+                    getattr(getattr(message, 'guild', None), 'id', '?'),
+                )
+
             # Send announcement to welcome channel if it's a new achievement
             if role_actually_changed:
                 await self._send_welcome_announcement(message, member, level, had_server_access_before)
-            
+            else:
+                logger.debug(
+                    "Verification: no level-up announcement for user %s (level unchanged at %s)",
+                    member.id, final_highest,
+                )
+
             # Send DM to user
             try:
                 await member.send(dm_message)
             except discord.Forbidden:
                 pass  # User has DMs disabled
-                
-        except Exception as e:
-            print(f"Error sending verification success messages: {e}")
+            except discord.HTTPException as exc:
+                logger.warning("Verification: could not DM user %s: %s", member.id, exc)
+
+        except Exception:
+            logger.exception(
+                "Error sending verification success messages for user %s", getattr(member, 'id', '?')
+            )
     
     async def _send_welcome_announcement(self, message, member, level, had_server_access_before):
-        """Send announcement to welcome channel"""
+        """Announce a quiz level-up in the guild's welcome channel.
+
+        Returns True when the message was sent. Every skip is logged with its
+        reason; this used to be print-only, so an unset/missing channel or a
+        missing permission looked the same as the feature not existing.
+        """
+        guild = getattr(message, 'guild', None) or getattr(member, 'guild', None)
+        if guild is None:
+            logger.warning(
+                "Level-up announcement skipped: no guild for user %s", getattr(member, 'id', '?')
+            )
+            return False
+
+        guild_id = str(guild.id)
+        welcome_channel_id = (self.bot.config.get('guilds') or {}).get(guild_id, {}).get('welcome_channel')
+        if not welcome_channel_id:
+            logger.warning(
+                "Level-up announcement for user %s skipped: no welcome channel configured for "
+                "guild %s (set one with /manage_welcome action:set_channel)",
+                getattr(member, 'id', '?'), guild_id,
+            )
+            return False
+
         try:
-            guild_id = str(message.guild.id)
-            welcome_channel_id = self.bot.config['guilds'].get(guild_id, {}).get('welcome_channel')
-            if welcome_channel_id:
-                welcome_channel = message.guild.get_channel(int(welcome_channel_id))
-                if welcome_channel:
-                    if level == 1 and not had_server_access_before:
-                        notification_text = f"🎉 **Level Up** · Welcome to the server, {member.mention}! You've reached **Level {level}**!"
-                    else:
-                        notification_text = f"🎯 **Level Up** · {member.mention} has reached **Level {level}**!"
-                    await welcome_channel.send(notification_text)
-        except Exception as e:
-            print(f"Error sending welcome announcement: {e}")
+            channel = guild.get_channel(int(welcome_channel_id))
+            if channel is None:
+                channel = guild.get_channel_or_thread(int(welcome_channel_id))
+        except (TypeError, ValueError):
+            logger.error(
+                "Level-up announcement skipped: welcome_channel %r for guild %s is not a "
+                "valid channel id",
+                welcome_channel_id, guild_id,
+            )
+            return False
+
+        if channel is None:
+            logger.error(
+                "Level-up announcement skipped: welcome channel %s does not exist in guild %s",
+                welcome_channel_id, guild_id,
+            )
+            return False
+
+        if level == 1 and not had_server_access_before:
+            notification_text = f"🎉 **Level Up** · Welcome to the server, {member.mention}! You've reached **Level {level}**!"
+        else:
+            notification_text = f"🎯 **Level Up** · {member.mention} has reached **Level {level}**!"
+
+        try:
+            await channel.send(
+                notification_text,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except discord.Forbidden:
+            logger.error(
+                "Level-up announcement failed: bot cannot send messages in #%s (guild %s)",
+                getattr(channel, 'name', welcome_channel_id), guild_id,
+            )
+            return False
+        except discord.HTTPException as exc:
+            logger.error(
+                "Level-up announcement failed in #%s (guild %s): %s",
+                getattr(channel, 'name', welcome_channel_id), guild_id, exc,
+            )
+            return False
+
+        logger.info(
+            "Announced Level %s level-up for user %s in #%s (guild %s)",
+            level, getattr(member, 'id', '?'),
+            getattr(channel, 'name', welcome_channel_id), guild_id,
+        )
+        return True
 
     def get_level_settings(self, level):
         """Get quiz settings for a specific level"""

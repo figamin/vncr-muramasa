@@ -64,6 +64,7 @@ class CommandsCog(commands.Cog):
     @app_commands.choices(action=[
         app_commands.Choice(name="set_channel", value="set_channel"),
         app_commands.Choice(name="test", value="test"),
+        app_commands.Choice(name="Test level-up announcement", value="test_levelup"),
     ])
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -72,6 +73,8 @@ class CommandsCog(commands.Cog):
                              channel: Optional[discord.TextChannel] = None):
         if action == "set_channel":
             await self._welcome_set_channel(interaction, channel)
+        elif action == "test_levelup":
+            await self._welcome_test_levelup(interaction)
         else:
             await self._welcome_test(interaction)
 
@@ -123,6 +126,33 @@ class CommandsCog(commands.Cog):
                 await interaction.response.send_message("I don't have permission to send welcome messages. Please check my permissions.", ephemeral=True)
             else:
                 await interaction.followup.send("I don't have permission to send welcome messages. Please check my permissions.", ephemeral=True)
+
+    async def _welcome_test_levelup(self, interaction: discord.Interaction):
+        """Send a sample level-up announcement through the verification cog's real path."""
+        verification = self.bot.get_cog("VerificationCog")
+        if verification is None:
+            await interaction.response.send_message(
+                "The verification cog is not loaded, so level-up announcements cannot be tested.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        # Level 2 with had_server_access_before=True produces the generic
+        # "has reached Level N" message, which is what level progression sends.
+        sent = await verification._send_welcome_announcement(
+            interaction, interaction.user, level=2, had_server_access_before=True
+        )
+        if sent:
+            await interaction.followup.send(
+                "Level-up announcement triggered in the welcome channel.", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "Not sent. The bot log now names the reason: no welcome channel configured, "
+                "the channel no longer exists, or the bot cannot send messages there.",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="manage_verification", description="[ADMIN] Set the verification channel or enable/disable verification")
     @app_commands.describe(action="What to do.", channel="(set_channel) Channel for verification welcome messages.")
