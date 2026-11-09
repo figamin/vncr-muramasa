@@ -283,6 +283,62 @@ class HighlightsCog(commands.Cog):
         # Use a lock for this specific message to prevent race conditions
         async with self._get_message_lock(message.id):
             try:
+    @staticmethod
+    def _missing_channel_permissions(channel, guild, required) -> list:
+        """Return human-readable names of permissions the bot lacks in a channel"""
+        perms = channel.permissions_for(guild.me)
+        return [label for label, attr in required if not getattr(perms, attr, False)]
+
+    async def _check_and_highlight_message(self, message: discord.Message, ignore_enabled: bool = False):
+        """Check if a message should be highlighted and post it if so.
+
+        ``ignore_enabled`` is used by the repair scan: an admin explicitly asked
+        for a backfill, even though live highlighting may still be switched off.
+        """
+        # Use a lock for this specific message to prevent race conditions
+        async with self._get_message_lock(message.id):
+            try:
+                guild = message.guild
+                if guild is None:
+                    return
+
+                # Check if highlights is enabled
+                if not ignore_enabled and not self._is_highlights_enabled(guild.id):
+                    logger.debug("Highlights: disabled for guild %s", guild.id)
+                    return
+
+                # Get highlights channel
+                highlights_channel_id = self._get_highlights_channel_id(guild.id)
+                if not highlights_channel_id:
+                    logger.debug("Highlights: no highlights channel configured for guild %s", guild.id)
+                    return
+
+                highlights_channel = guild.get_channel(highlights_channel_id)
+                if not highlights_channel:
+                    logger.error(
+                        "Highlights: configured highlights channel %s does not exist in guild %s",
+                        highlights_channel_id, guild.id,
+                    )
+                    return
+
+                # Check if message was already highlighted
+                if message.id in self.highlighted_messages:
+                    return
+
+                # Don't highlight messages from the highlights channel itself
+                if message.channel.id == highlights_channel_id:
+                    return
+
+                # Don't highlight messages from excluded channels
+                excluded_channels = ["announcements", "rules-info", "resources"]
+                if getattr(message.channel, 'name', '').lower() in excluded_channels:
+                    return
+
+                # Don't highlight messages older than MESSAGE_MAX_AGE_DAYS
+                message_age = datetime.now(timezone.utc) - message.created_at
+                if message_age > timedelta(days=self.MESSAGE_MAX_AGE_DAYS):
+                    return
+
                 # Determine the effective poster. The bot's webhook reposts (word filter /
                 # media flag) carry the original poster's identity, so a bot/webhook
                 # message is eligible only if it is one of those reposts; in that case
@@ -396,6 +452,339 @@ class HighlightsCog(commands.Cog):
         """Handle when a reaction is removed from a message"""
         # Highlights stay posted once sent; reaction removals are ignored
         pass
+
+    # ------------------------------------------------------------------
+    # One-time repair scan
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _message_id_from_jump_url(url: Optional[str]) -> Optional[int]:
+        """Extract the message id from a Discord jump URL."""
+        if not url:
+            return None
+        try:
+            return int(url.rstrip('/').rsplit('/', 1)[-1])
+        except (TypeError, ValueError):
+            return None
+
+    def _load_backfill_state(self) -> dict:
+        """Load the marker recording which guilds were already repaired."""
+        try:
+            if os.path.exists(self.BACKFILL_MARKER_FILE):
+                with open(self.BACKFILL_MARKER_FILE, 'r') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault('completed_guilds', {})
+                    return data
+                logger.error(
+                    "Highlights backfill: %s is not a JSON object; ignoring it",
+                    self.BACKFILL_MARKER_FILE,
+                )
+        except Exception:
+            logger.exception(
+                "Highlights backfill: could not read marker %s", self.BACKFILL_MARKER_FILE
+            )
+        return {'completed_guilds': {}}
+
+    def _save_backfill_state(self, state: dict):
+        """Persist the marker so restarts do not repeat the scan."""
+        try:
+            os.makedirs(os.path.dirname(self.BACKFILL_MARKER_FILE), exist_ok=True)
+            tmp_path = f"{self.BACKFILL_MARKER_FILE}.tmp"
+            with open(tmp_path, 'w') as f:
+                json.dump(state, f, indent=4)
+            os.replace(tmp_path, self.BACKFILL_MARKER_FILE)
+        except Exception:
+            logger.exception(
+                "Highlights backfill: could not write marker %s", self.BACKFILL_MARKER_FILE
+            )
+
+    async def _collect_highlighted_message_ids(
+        self,
+        highlights_channel: discord.abc.GuildChannel,
+        cutoff: datetime,
+    ) -> Set[int]:
+        """Recover the original message ids already posted in the highlights channel.
+
+        Every highlight is posted with a "Jump to Message" link button, so the id
+        of the original message is the last segment of that URL.
+        """
+        found: Set[int] = set()
+        if self.bot.user is None:
+            return found
+        try:
+            async for posted in highlights_channel.history(
+                limit=None, after=cutoff, oldest_first=True
+            ):
+                if posted.author.id != self.bot.user.id:
+                    continue
+                for row in posted.components:
+                    for child in getattr(row, 'children', []):
+                        message_id = self._message_id_from_jump_url(getattr(child, 'url', None))
+                        if message_id is None:
+                            continue
+                        found.add(message_id)
+                        # Treat it as highlighted so it is never posted twice, even
+                        # if it was not in the local state file.
+                        self.highlighted_messages.setdefault(message_id, _as_utc(posted.created_at))
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Highlights backfill: could not read existing highlights in #%s",
+                getattr(highlights_channel, 'name', highlights_channel.id),
+            )
+        return found
+
+    async def _backfill_guild(self, guild: discord.Guild, ignore_enabled: bool = False) -> dict:
+        """Scan a guild's recent messages and post any highlight that was missed."""
+        stats = {
+            'guild_id': guild.id,
+            'channels_scanned': 0,
+            'channels_skipped': [],
+            'messages_scanned': 0,
+            'candidates': 0,
+            'posted': 0,
+            'error': None,
+        }
+
+        highlights_channel_id = self._get_highlights_channel_id(guild.id)
+        highlights_channel = (
+            guild.get_channel(highlights_channel_id) if highlights_channel_id else None
+        )
+        if highlights_channel is None:
+            stats['error'] = 'highlights channel is not configured or not found'
+            logger.error("Highlights backfill: %s (guild %s)", stats['error'], guild.id)
+            return stats
+
+        missing = self._missing_channel_permissions(
+            highlights_channel,
+            guild,
+            (
+                ("View Channel", "view_channel"),
+                ("Read Message History", "read_message_history"),
+                ("Send Messages", "send_messages"),
+                ("Embed Links", "embed_links"),
+            ),
+        )
+        if missing:
+            stats['error'] = f"missing permissions in highlights channel: {', '.join(missing)}"
+            logger.error("Highlights backfill: %s (guild %s)", stats['error'], guild.id)
+            return stats
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.MESSAGE_MAX_AGE_DAYS)
+        threshold = self._get_reaction_threshold(guild.id)
+
+        # Read the highlights channel first: this is both the duplicate guard and
+        # the comparison the operator asked for ("compare with existing highlights").
+        existing = await self._collect_highlighted_message_ids(highlights_channel, cutoff)
+        logger.info(
+            "Highlights backfill: found %d existing highlight(s) in #%s (guild %s)",
+            len(existing),
+            getattr(highlights_channel, 'name', highlights_channel.id),
+            guild.id,
+        )
+
+        excluded_channels = ["announcements", "rules-info", "resources"]
+
+        # Text channels plus currently active threads; archived threads are left
+        # alone so a one-time repair cannot turn into a multi-hour crawl.
+        channels = list(guild.text_channels) + list(guild.threads)
+        for channel in channels:
+            if channel.id == highlights_channel.id:
+                continue
+            parent = getattr(channel, 'parent', None)
+            if getattr(channel, 'name', '').lower() in excluded_channels:
+                continue
+            if parent is not None and (
+                parent.id == highlights_channel.id
+                or parent.name.lower() in excluded_channels
+            ):
+                continue
+
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                stats['channels_skipped'].append(channel.name)
+                logger.warning(
+                    "Highlights backfill: skipping #%s (guild %s); "
+                    "bot lacks View Channel / Read Message History",
+                    channel.name, guild.id,
+                )
+                continue
+
+            stats['channels_scanned'] += 1
+            try:
+                async for message in channel.history(
+                    limit=None, after=cutoff, oldest_first=True
+                ):
+                    stats['messages_scanned'] += 1
+                    if stats['messages_scanned'] % 1000 == 0:
+                        logger.info(
+                            "Highlights backfill: %d message(s) scanned so far (guild %s)",
+                            stats['messages_scanned'], guild.id,
+                        )
+
+                    # Already handled (existing highlight or posted in this pass)
+                    if message.id in self.highlighted_messages:
+                        continue
+                    # Another bot's message can never be highlighted (only this
+                    # bot's webhook reposts are eligible).
+                    if message.author.bot and message.webhook_id is None:
+                        continue
+                    # Cheap lower bound: unique reactors can never exceed the total
+                    # reaction count, so this skips most messages without API calls.
+                    if sum(reaction.count for reaction in message.reactions) < threshold:
+                        continue
+
+                    stats['candidates'] += 1
+                    await self._check_and_highlight_message(
+                        message, ignore_enabled=ignore_enabled
+                    )
+                    if message.id in self.highlighted_messages:
+                        stats['posted'] += 1
+            except (discord.Forbidden, discord.HTTPException):
+                stats['channels_skipped'].append(channel.name)
+                logger.exception(
+                    "Highlights backfill: failed reading #%s (guild %s)",
+                    channel.name, guild.id,
+                )
+
+        # Persist the ids recovered from the highlights channel as well as new ones.
+        self._save_highlighted_messages()
+        logger.info(
+            "Highlights backfill done for guild %s: %d channel(s), %d message(s), "
+            "%d candidate(s), %d posted",
+            guild.id,
+            stats['channels_scanned'],
+            stats['messages_scanned'],
+            stats['candidates'],
+            stats['posted'],
+        )
+        return stats
+
+    async def _backfill_missed_highlights(
+        self,
+        force: bool = False,
+        guild: Optional[discord.Guild] = None,
+    ) -> Optional[list]:
+        """Repair highlights that were missed while the bot was not working.
+
+        Runs at most once per guild, tracked in BACKFILL_MARKER_FILE. ``force``
+        (used by /manage_highlights backfill) scans the guild again. A manual run
+        ignores the ``highlights_enabled`` flag: that flag also gates live posting,
+        so it may be the very thing that was broken, and an admin asking for a
+        backfill clearly wants the repair. Returns None if a scan is already
+        running, otherwise the per-guild result dicts.
+        """
+        if self._backfill_lock.locked():
+            logger.info("Highlights backfill: a scan is already running; skipping")
+            return None
+
+        results = []
+        async with self._backfill_lock:
+            state = self._load_backfill_state()
+            completed = state.setdefault('completed_guilds', {})
+            targets = [guild] if guild is not None else list(self.bot.guilds)
+            manual = force or guild is not None
+
+            for target in targets:
+                if target is None:
+                    continue
+
+                if not manual:
+                    # The automatic startup scan only runs where highlights are
+                    # actually in use.
+                    if not self._is_highlights_enabled(target.id):
+                        logger.debug(
+                            "Highlights backfill: feature disabled for guild %s; skipping",
+                            target.id,
+                        )
+                        continue
+                    if self._get_highlights_channel_id(target.id) is None:
+                        continue
+
+                if not force and str(target.id) in completed:
+                    logger.debug(
+                        "Highlights backfill: guild %s already repaired, skipping", target.id
+                    )
+                    continue
+
+                logger.info(
+                    "Highlights backfill: scanning guild %s (%s)", target.id, target.name
+                )
+                stats = await self._backfill_guild(target, ignore_enabled=manual)
+                results.append(stats)
+
+                if stats.get('error'):
+                    # Leave it unmarked so the next start retries after the
+                    # configuration or permissions are fixed.
+                    continue
+
+                completed[str(target.id)] = datetime.now(timezone.utc).isoformat()
+                self._save_backfill_state(state)
+
+        return results
+
+    async def _run_backfill_after_ready(self):
+        """Wrapper that waits for READY before scanning, once per process."""
+        try:
+            await self.bot.wait_until_ready()
+            await self._backfill_missed_highlights()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Highlights backfill: one-time scan failed")
+
+    async def _highlights_backfill(self, interaction: discord.Interaction):
+        """Manually re-run the repair scan for this guild."""
+        await interaction.response.defer(ephemeral=True)
+        results = await self._backfill_missed_highlights(force=True, guild=interaction.guild)
+
+        if results is None:
+            await interaction.followup.send(
+                "⏳ A backfill scan is already running. Try again in a moment.",
+                ephemeral=True,
+            )
+            return
+        if not results:
+            await interaction.followup.send(
+                "ℹ️ Nothing to scan for this server.",
+                ephemeral=True,
+            )
+            return
+
+        stats = results[0]
+        if stats.get('error'):
+            await interaction.followup.send(
+                f"❌ Backfill could not run: {stats['error']}",
+                ephemeral=True,
+            )
+            return
+
+        lines = [
+            f"Channels scanned: **{stats['channels_scanned']}**",
+            f"Messages scanned: **{stats['messages_scanned']}**",
+            f"Messages that met the reaction count: **{stats['candidates']}**",
+            f"Highlights posted: **{stats['posted']}**",
+        ]
+        skipped = stats.get('channels_skipped') or []
+        if skipped:
+            lines.append(
+                "Skipped channels (no access): "
+                + ", ".join(f"`{name}`" for name in skipped)
+            )
+        if not self._is_highlights_enabled(interaction.guild.id):
+            lines.append(
+                "⚠️ **Live highlights are currently disabled.** These were one-time "
+                "repair posts; enable live highlighting with "
+                "`/manage_highlights setup enabled:true`."
+            )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="🧹 Highlight backfill complete",
+                description="\n".join(lines),
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
+        )
     
     @app_commands.command(name="manage_highlights", description="[ADMIN] Configure or view the highlights feature")
     @app_commands.describe(
