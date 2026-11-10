@@ -90,7 +90,7 @@ async def load_extensions():
         # 'cogs.backup',  # Not loaded: muramasa owns DB backups; sakura is lent to
         # servers whose admins must not reach /manage_backups on the shared DB.
         'cogs.error_logging',
-        'cogs.verification',  # Hiragana quiz verification
+        'cogs.verification',  # Level quizzes (N5-Insane) that grant roles
         'cogs.immersion',  # Core time tracking - works for anime too
         'cogs.highlights'
     ]
