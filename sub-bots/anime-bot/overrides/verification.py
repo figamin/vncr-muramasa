@@ -155,9 +155,10 @@ class VerificationCog(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.data_dir = Path(__file__).parent.parent / 'data'
-        self.data_dir.mkdir(exist_ok=True)
-        self.data_file = self.data_dir / 'quiz_roles_data.json'
+        # The main data/ folder (next to vnbot.db), which Docker keeps between rebuilds
+        self.data_dir = Path(__file__).resolve().parents[3] / 'data'
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_file = self.data_dir / 'anime_quiz_roles.json'
         self.data = self.load_data()
         # Look up quizzes by their exact deck set
         self.quizzes_by_decks = {_normalize_decks(q["decks"]): q for q in QUIZZES}
@@ -165,14 +166,18 @@ class VerificationCog(commands.Cog):
     # ---------------- data (who passed what, for restoring on rejoin) ----------------
 
     def load_data(self) -> dict:
-        if self.data_file.exists():
+        # Earlier versions kept this file in sub-bots/anime-bot/data/; carry it over once
+        legacy_file = Path(__file__).parent.parent / 'data' / 'quiz_roles_data.json'
+        for path in (self.data_file, legacy_file):
+            if not path.exists():
+                continue
             try:
-                with open(self.data_file, 'r') as f:
+                with open(path, 'r') as f:
                     data = json.load(f)
                 if isinstance(data.get("passed"), dict):
                     return data
             except (json.JSONDecodeError, OSError) as e:
-                print(f"[Anime Quiz] Error loading quiz data: {e}")
+                print(f"[Anime Quiz] Error loading quiz data from {path}: {e}")
         return {"passed": {q["key"]: [] for q in QUIZZES}}
 
     def save_data(self):

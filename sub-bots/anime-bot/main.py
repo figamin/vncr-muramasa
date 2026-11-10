@@ -91,6 +91,7 @@ async def load_extensions():
         # servers whose admins must not reach /manage_backups on the shared DB.
         'cogs.error_logging',
         'cogs.verification',  # Level quizzes (N5-Insane) that grant roles
+        'cogs.consequences',  # Monthly anime penalty/reward roles (anime-bot only: overrides/consequences.py)
         'cogs.immersion',  # Core time tracking - works for anime too
         'cogs.highlights'
     ]

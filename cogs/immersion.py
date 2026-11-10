@@ -342,62 +342,98 @@ def _format_history_entry(activity: Activity) -> str:
     return "\n".join(lines)
 
 
-class UndoLogView(discord.ui.View):
-    """View with an Undo button to delete a recently logged activity"""
-    
-    def __init__(self, activity_id: int, user_id: int, cog: 'ImmersionCog'):
-        super().__init__(timeout=300)  # 5 minute timeout
+class UndoLogButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"undo_log:(?P<activity_id>[0-9]+):(?P<user_id>[0-9]+)",
+):
+    """Undo button for a logged activity.
+
+    The activity and owner are stored in the button's custom_id, so the button
+    keeps working after the bot restarts and never silently expires. (The old
+    5-minute view left a clickable-looking button that Discord reported as
+    "didn't respond in time".) Registered with bot.add_dynamic_items in cog_load.
+    """
+
+    def __init__(self, activity_id: int, user_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Undo Log",
+                style=discord.ButtonStyle.danger,
+                emoji="↩️",
+                custom_id=f"undo_log:{activity_id}:{user_id}",
+            )
+        )
         self.activity_id = activity_id
         self.user_id = user_id
-        self.cog = cog
-    
-    @discord.ui.button(label="Undo Log", style=discord.ButtonStyle.danger, emoji="↩️")
-    async def undo_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Handle the undo button press"""
-        # Check if the user pressing the button is the one who created the log
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+        return cls(int(match["activity_id"]), int(match["user_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        # Only the person who created the log can undo it
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
                 "❌ You can only undo your own logs!",
                 ephemeral=True
             )
             return
-        
-        # Delete the activity
-        success = await self.cog.activity_repo.delete_activity(self.activity_id, str(self.user_id))
-        
-        if success:
-            # Disable the button
-            button.disabled = True
-            button.label = "Undone"
-            button.style = discord.ButtonStyle.secondary
-            await interaction.response.edit_message(view=self)
-            
-            # Send confirmation
+
+        # Acknowledge first: Discord gives up after 3 seconds, and the shared
+        # database can take longer than that when it is busy.
+        await interaction.response.defer()
+
+        cog = interaction.client.get_cog("ImmersionCog")
+        if cog is None:
             await interaction.followup.send(
-                f"✅ Activity ID `{self.activity_id}` has been deleted.",
+                "❌ Logging is unavailable right now. Please try `/log_undo` in a moment.",
                 ephemeral=True
             )
-            
-            # Re-sync roles in case this affects class progression
-            try:
-                await self.cog._sync_roles_and_notify(
-                    interaction,
-                    source="undo_log",
-                    actor=interaction.user,
-                )
-            except Exception as e:
-                logger.error(f"Error syncing roles after undo: {e}")
-        else:
-            await interaction.response.send_message(
+            return
+
+        success = await cog.activity_repo.delete_activity(self.activity_id, str(self.user_id))
+        if not success:
+            await interaction.followup.send(
                 f"❌ Failed to delete activity ID `{self.activity_id}`. It may have already been deleted.",
                 ephemeral=True
             )
-    
-    async def on_timeout(self):
-        """Disable the button when the view times out"""
-        self.undo_button.disabled = True
-        self.undo_button.label = "Expired"
-        self.undo_button.style = discord.ButtonStyle.secondary
+            return
+
+        # Grey out the button on the log message
+        self.item.disabled = True
+        self.item.label = "Undone"
+        self.item.style = discord.ButtonStyle.secondary
+        try:
+            await interaction.edit_original_response(view=self.view)
+        except discord.HTTPException as e:
+            logger.warning(f"Could not update undo button for activity {self.activity_id}: {e}")
+
+        await interaction.followup.send(
+            f"✅ Activity ID `{self.activity_id}` has been deleted.",
+            ephemeral=True
+        )
+
+        # Same follow-up work as /log_undo: refresh goals, then re-sync class roles
+        try:
+            await cog.goal_service.refresh_user_goals(str(self.user_id))
+        except Exception as e:
+            logger.error(f"Error refreshing goals after undo: {e}")
+        try:
+            await cog._sync_roles_and_notify(
+                interaction,
+                source="undo_log",
+                actor=interaction.user,
+            )
+        except Exception as e:
+            logger.error(f"Error syncing roles after undo: {e}")
+
+
+class UndoLogView(discord.ui.View):
+    """View holding the Undo Log button; callers may add link buttons to it."""
+
+    def __init__(self, activity_id: int, user_id: int, cog: Optional['ImmersionCog'] = None):
+        super().__init__(timeout=None)
+        self.add_item(UndoLogButton(activity_id, user_id))
 
 
 class ImmersionCog(commands.Cog):
@@ -429,6 +465,9 @@ class ImmersionCog(commands.Cog):
         """Initialize the cog"""
         await self.db.initialize()
         logger.info("Immersion tracking cog loaded")
+
+        # Undo buttons on log messages keep working across restarts
+        self.bot.add_dynamic_items(UndoLogButton)
 
         if not self.class_role_sync.is_running():
             self.class_role_sync.start()
