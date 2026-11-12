@@ -8,6 +8,8 @@ anime-specific roles based on total anime watching time.
 OVERRIDES PROVIDED:
 ✅ _sync_reward_roles() - Uses anime time for role assignments (core override)
 ✅ _sync_roles_and_notify() - Also tells the consequences cog after each log/undo
+✅ log_undo + Undo Log button - Admins can undo other members' logs
+✅ log_anime - Blocked for members with the logging-ban role (LOG_BAN_ROLE_ID)
 ✅ profile - Shows anime-focused immersion profile
 ✅ Helper methods for anime class progress display
 
@@ -40,12 +42,19 @@ from cogs.immersion import (
     DEFAULT_SPECIAL_RANK_ROLES,
     ANIME_CLASS_ROLE_DEFINITIONS,
     UndoLogButton,
+    DATE_FORMAT_HELP,
+    _format_duration_value,
     _format_hours_display,
 )
 from utils.database import Database
 from utils.immersion_repository import ActivityRepository, GoalRepository, UserRepository
 from utils.immersion_services import UserTimeService, GoalService, GuildRepository
 from utils.immersion_media import MediaSearcher
+
+# Members with this role can't use /log_anime (the only command that logs anime)
+LOG_BAN_ROLE_ID = 1570445186394226709
+LOG_BAN_MESSAGE = "Uh oh! It seems like you've been naughty and aren't allowed to use the log command."
+
 
 class ImmersionCog(ParentImmersionCog):
     """Extended immersion cog with anime-focused role progression"""
@@ -112,6 +121,119 @@ class ImmersionCog(ParentImmersionCog):
         if interaction is not None and interaction.guild is not None and actor is not None:
             self.bot.dispatch("anime_log_changed", interaction.guild, actor)
         return await super()._sync_roles_and_notify(interaction, source, actor)
+
+    # ---------------- logging ban ----------------
+
+    @staticmethod
+    def _is_banned_from_logging(member: Union[discord.Member, discord.User]) -> bool:
+        return any(role.id == LOG_BAN_ROLE_ID for role in getattr(member, "roles", []))
+
+    # Same name, options and autocomplete as the parent's /log_anime (keep them in step);
+    # it only adds the ban check before handing over to the parent command.
+    @app_commands.command(name="log_anime", description="Log anime watching")
+    @app_commands.describe(
+        name="Name of the anime",
+        episodes="Number of episodes watched",
+        episode_duration="Duration per episode in minutes (default: 24)",
+        date=DATE_FORMAT_HELP,
+        comment="Optional comment or note about this log entry"
+    )
+    @app_commands.autocomplete(date=ParentImmersionCog._date_autocomplete)
+    async def log_anime(self, interaction: discord.Interaction, name: str,
+                        episodes: int, episode_duration: int = 24, date: str = None, comment: str = None):
+        """Log anime watching, unless the member has the logging-ban role."""
+        if self._is_banned_from_logging(interaction.user):
+            await interaction.response.send_message(LOG_BAN_MESSAGE, ephemeral=True)
+            return
+        await ParentImmersionCog.log_anime.callback(
+            self, interaction, name, episodes, episode_duration, date, comment
+        )
+
+    # ---------------- undoing logs: admins can undo anyone's ----------------
+
+    @staticmethod
+    def _is_log_admin(member: Union[discord.Member, discord.User]) -> bool:
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and perms.administrator)
+
+    def _can_undo_log(self, member: Union[discord.Member, discord.User], owner_id: int) -> bool:
+        """The Undo Log button works for the log's owner and for admins."""
+        return super()._can_undo_log(member, owner_id) or self._is_log_admin(member)
+
+    @app_commands.command(name="log_undo", description="Undo your last activity (admins can undo anyone's)")
+    @app_commands.describe(
+        activity_id="Specific activity ID to undo (optional; admins can use anyone's)",
+        user="Admins only: undo this member's most recent log",
+    )
+    async def log_undo(
+        self,
+        interaction: discord.Interaction,
+        activity_id: Optional[int] = None,
+        user: Optional[discord.Member] = None,
+    ):
+        """Undo your own last log, or (admins) another member's log."""
+        try:
+            await interaction.response.defer()
+
+            caller = interaction.user
+            is_admin = self._is_log_admin(caller)
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            target = user or caller
+            activity = None
+            failure = None
+
+            if target.id != caller.id and not is_admin:
+                failure = "Only admins can undo other members' logs."
+            elif activity_id:
+                activity = await self.activity_repo.get_activity_by_id(activity_id)
+                if (
+                    activity is None
+                    or (str(activity.user_id) != str(caller.id) and not is_admin)
+                    or (user is not None and str(activity.user_id) != str(user.id))
+                ):
+                    failure = "Activity not found or you don't have permission to undo it."
+            else:
+                activity = await self.activity_repo.get_latest_activity(str(target.id), guild_id)
+                if activity is None:
+                    who = "You don't" if target.id == caller.id else f"{target.display_name} doesn't"
+                    embed = discord.Embed(
+                        title="No Logs to Undo",
+                        description=f"{who} have any recent logs to undo.",
+                        color=discord.Color.blue(),
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+
+            success = False
+            if failure is None:
+                owner_id = str(activity.user_id)
+                success = await self.activity_repo.delete_activity(activity.id, owner_id)
+                if not success:
+                    failure = "Failed to undo the activity."
+
+            if failure:
+                embed = discord.Embed(title="Undo Failed", description=failure, color=discord.Color.red())
+                await interaction.followup.send(embed=embed)
+                return
+
+            await self.goal_service.refresh_user_goals(owner_id)
+            description = f"Removed: {activity.name} ({_format_duration_value(activity.duration)})"
+            if owner_id != str(caller.id):
+                description += f"\nLogged by <@{owner_id}>, undone by {caller.mention}"
+            embed = discord.Embed(title="Activity Undone", description=description, color=discord.Color.green())
+            await interaction.followup.send(embed=embed)
+
+            # Role sync and penalty/reward checks are about the log's owner
+            owner = interaction.guild.get_member(int(owner_id)) if interaction.guild else None
+            await self._sync_roles_and_notify(
+                interaction,
+                source="activity_undo",
+                actor=owner or caller,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in log_undo command: {e}")
+            await interaction.followup.send("An error occurred while undoing the activity.", ephemeral=True)
 
     async def _sync_reward_roles(self, guild: discord.Guild, source: str) -> Dict[str, int]:
         """
