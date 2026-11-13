@@ -60,7 +60,7 @@ REWARD_ANNOUNCEMENT = "{user} got a 💮 for logging over 15 hours of anime this
 TOP_CHANNEL_ID = 1416801076887289906
 TOP_ROLE_IDS = [1570444932861272195, 1570445140307214437, 1570445160259649636]
 # {month} becomes e.g. "November 2026"; {places} becomes one line per place.
-TOP_ANNOUNCEMENT = "🏆 Top anime watchers of {month}!\n{places}\nCongratulations!"
+TOP_ANNOUNCEMENT = "🏆 Top anime watchers of {month}!\n{places}"
 # {user} pings the member; {hours} is their anime time that month, e.g. "42.5h".
 TOP_PLACE_LINES = ["🥇 {user} with {hours}", "🥈 {user} with {hours}", "🥉 {user} with {hours}"]
 
