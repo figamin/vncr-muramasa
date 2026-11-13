@@ -55,6 +55,15 @@ PENALTY_IMAGE = Path(__file__).parent.parent / "assets" / "consequences" / "psyc
 # {user} pings the member.
 REWARD_ANNOUNCEMENT = "{user} got a 💮 for logging over 15 hours of anime this month!"
 
+# Monthly top 3: on the 1st, the members who logged the most anime time in the month
+# that just ended are announced here and get these roles (1st, 2nd, 3rd place).
+TOP_CHANNEL_ID = 1416801076887289906
+TOP_ROLE_IDS = [1570444932861272195, 1570445140307214437, 1570445160259649636]
+# {month} becomes e.g. "November 2026"; {places} becomes one line per place.
+TOP_ANNOUNCEMENT = "🏆 Top anime watchers of {month}!\n{places}"
+# {user} pings the member; {hours} is their anime time that month, e.g. "42.5h".
+TOP_PLACE_LINES = ["🥇 {user} with {hours}", "🥈 {user} with {hours}", "🥉 {user} with {hours}"]
+
 CHECK_INTERVAL_MINUTES = 10   # how often the background check runs
 
 # Month-end penalty roles go out one person at a time. ~400 people at 1 per second
@@ -133,6 +142,7 @@ class ConsequencesCog(commands.Cog):
     #                    "given": how many got the role, "announced": message posted?}
     #   penalty_months - {user_id: month they were last penalized for}, so nobody is
     #                    penalized twice for the same month
+    #   top_announced_month - last month whose top 3 was announced
 
     def load_data(self) -> dict:
         if self.data_file.exists():
@@ -470,8 +480,74 @@ class ConsequencesCog(commands.Cog):
         for user_id, reward in list(state["rewards"].items()):
             if reward.get("expires", "") <= current:
                 await self.remove_reward(state, guild, user_id)
+        # The monthly top 3 isn't affected by turning the penalty/reward system off
+        try:
+            await self.announce_monthly_top(guild, state, judged)
+        except Exception as e:
+            logger.exception(f"[Consequences] Monthly top 3 failed in {guild.name}: {e}")
         state["last_rollover"] = current
         self.save_data()
+
+    async def monthly_top(self, guild: discord.Guild, month: str) -> List[Tuple[discord.Member, int]]:
+        """The top 3 server members by anime time logged in `month` (anime logs only)."""
+        totals = await self.anime_seconds_in_month(month)
+        ranked = []
+        for user_id, seconds in totals.items():
+            member = guild.get_member(int(user_id))
+            if member is not None and not member.bot and seconds > 0:
+                ranked.append((member, seconds))
+        ranked.sort(key=lambda pair: (-pair[1], pair[0].id))
+        return ranked[:len(TOP_ROLE_IDS)]
+
+    async def announce_monthly_top(self, guild: discord.Guild, state: dict, month: str):
+        """Announce last month's top 3 and move the 1st/2nd/3rd place roles to them."""
+        if state.get("top_announced_month") == month:
+            return
+        # Marked first, so a crash or restart can never announce twice
+        state["top_announced_month"] = month
+        self.save_data()
+
+        if not guild.chunked:
+            await guild.chunk(cache=True)
+        top = await self.monthly_top(guild, month)
+
+        # Each place role goes to this month's holder only
+        for place, role_id in enumerate(TOP_ROLE_IDS):
+            role = guild.get_role(role_id)
+            if role is None:
+                logger.warning(f"[Consequences] Top {place + 1} role {role_id} doesn't exist")
+                continue
+            winner = top[place][0] if place < len(top) else None
+            for holder in list(role.members):
+                if holder != winner:
+                    try:
+                        await holder.remove_roles(role, reason=f"No longer top {place + 1} for anime time")
+                    except discord.HTTPException as e:
+                        logger.warning(f"[Consequences] Can't remove top role from {holder}: {e}")
+            if winner is not None and role not in winner.roles:
+                try:
+                    await winner.add_roles(role, reason=f"Top {place + 1} for anime time in {month}")
+                except discord.HTTPException as e:
+                    logger.warning(f"[Consequences] Can't give top role to {winner}: {e}")
+
+        if not top:
+            logger.info(f"[Consequences] {guild.name}: nobody logged anime in {month}, no top 3 announcement")
+            return
+        channel = guild.get_channel(TOP_CHANNEL_ID)
+        if channel is None:
+            logger.warning(f"[Consequences] Top 3 channel {TOP_CHANNEL_ID} not found in {guild.name}")
+            return
+        places = "\n".join(
+            TOP_PLACE_LINES[place].format(user=member.mention, hours=hours(seconds))
+            for place, (member, seconds) in enumerate(top)
+        )
+        text = TOP_ANNOUNCEMENT.format(month=month_name(month), places=places)
+        try:
+            await channel.send(
+                text, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[m for m, _ in top])
+            )
+        except discord.HTTPException as e:
+            logger.error(f"[Consequences] Can't post the monthly top 3: {e}")
 
     def record_join_dates(self, guild: discord.Guild, state: dict):
         """Remember everyone's join date, so leaving and rejoining after the 15th
@@ -666,6 +742,7 @@ class ConsequencesCog(commands.Cog):
         app_commands.Choice(name=f"Release check ({RELEASE_HOURS}h logged since the penalty)", value="release"),
         app_commands.Choice(name=f"Reward check ({REWARD_THRESHOLD_HOURS}h+ this month)", value="reward"),
         app_commands.Choice(name="Reward expiry", value="expiry"),
+        app_commands.Choice(name="Monthly top 3 preview (no pings, no roles)", value="top"),
     ])
     async def test_consequence(self, interaction: discord.Interaction, event: Optional[app_commands.Choice[str]] = None):
         if not self.is_admin(interaction):
@@ -734,6 +811,22 @@ class ConsequencesCog(commands.Cog):
                 else:
                     reply = f"You've logged {hours(seconds)} this month; the reward needs {REWARD_THRESHOLD_HOURS}h."
 
+            elif choice == "top":
+                # Only shown to the admin: nobody is pinged and no roles change
+                top = await self.monthly_top(guild, month)
+                if top:
+                    places = "\n".join(
+                        TOP_PLACE_LINES[place].format(user=m.mention, hours=hours(s))
+                        for place, (m, s) in enumerate(top)
+                    )
+                    reply = (
+                        f"Top 3 so far for {month_name(month)} (preview only). On the 1st of next month this "
+                        f"is posted in <#{TOP_CHANNEL_ID}> with pings, and the place roles move:\n\n"
+                        + TOP_ANNOUNCEMENT.format(month=month_name(month), places=places)
+                    )
+                else:
+                    reply = f"Nobody has logged anime in {month_name(month)} yet."
+
             else:  # expiry
                 reward_role = guild.get_role(REWARD_ROLE_ID)
                 if user_id not in state["rewards"] and not (reward_role and reward_role in member.roles):
@@ -742,7 +835,7 @@ class ConsequencesCog(commands.Cog):
                     error = await self.remove_reward(state, guild, user_id)
                     reply = error or "✅ The reward role was removed, as it would be when it expires. You're no longer immune."
 
-        await interaction.followup.send(reply + note, ephemeral=True)
+        await interaction.followup.send(reply + note, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def setup(bot):

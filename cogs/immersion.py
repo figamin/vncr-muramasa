@@ -371,8 +371,13 @@ class UndoLogButton(
         return cls(int(match["activity_id"]), int(match["user_id"]))
 
     async def callback(self, interaction: discord.Interaction):
-        # Only the person who created the log can undo it
-        if interaction.user.id != self.user_id:
+        # The person who created the log can undo it (the cog decides who else may)
+        cog = interaction.client.get_cog("ImmersionCog")
+        if cog is not None:
+            allowed = cog._can_undo_log(interaction.user, self.user_id)
+        else:
+            allowed = interaction.user.id == self.user_id
+        if not allowed:
             await interaction.response.send_message(
                 "❌ You can only undo your own logs!",
                 ephemeral=True
@@ -383,7 +388,6 @@ class UndoLogButton(
         # database can take longer than that when it is busy.
         await interaction.response.defer()
 
-        cog = interaction.client.get_cog("ImmersionCog")
         if cog is None:
             await interaction.followup.send(
                 "❌ Logging is unavailable right now. Please try `/log_undo` in a moment.",
@@ -408,12 +412,15 @@ class UndoLogButton(
         except discord.HTTPException as e:
             logger.warning(f"Could not update undo button for activity {self.activity_id}: {e}")
 
+        owner_note = "" if interaction.user.id == self.user_id else f" (logged by <@{self.user_id}>)"
         await interaction.followup.send(
-            f"✅ Activity ID `{self.activity_id}` has been deleted.",
+            f"✅ Activity ID `{self.activity_id}`{owner_note} has been deleted.",
             ephemeral=True
         )
 
-        # Same follow-up work as /log_undo: refresh goals, then re-sync class roles
+        # Same follow-up work as /log_undo: refresh goals, then re-sync class roles.
+        # Both are about the log's owner, even when someone else (an admin) undid it.
+        owner = interaction.guild.get_member(self.user_id) if interaction.guild else None
         try:
             await cog.goal_service.refresh_user_goals(str(self.user_id))
         except Exception as e:
@@ -422,7 +429,7 @@ class UndoLogButton(
             await cog._sync_roles_and_notify(
                 interaction,
                 source="undo_log",
-                actor=interaction.user,
+                actor=owner or interaction.user,
             )
         except Exception as e:
             logger.error(f"Error syncing roles after undo: {e}")
@@ -3531,6 +3538,11 @@ class ImmersionCog(commands.Cog):
         except Exception as exc:
             logger.error(f"Error while running class_roles_sync: {exc}")
             await interaction.followup.send("An error occurred while syncing roles.", ephemeral=True)
+
+    def _can_undo_log(self, member: Union[discord.Member, discord.User], owner_id: int) -> bool:
+        """Who may undo a log with its Undo Log button: only its owner here.
+        The anime bot's override also lets admins undo anyone's logs."""
+        return getattr(member, "id", None) == owner_id
 
     @app_commands.command(name="log_undo", description="Undo your last activity")
     @app_commands.describe(activity_id="Specific activity ID to undo (optional)")

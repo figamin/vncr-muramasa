@@ -332,7 +332,9 @@ class CommandsCog(commands.Cog):
                     embed.add_field(
                         name="🔧 Utilities",
                         value=(
-                            "• `/log_undo`: Undo the last activity or specific activity by ID"
+                            "• `/log_undo`: Undo the last activity or specific activity by ID\n"
+                            "• Admins can undo other members' logs: `/log_undo user:` for their latest log, "
+                            "`activity_id:` for any log, or the Undo Log button on their log"
                         ),
                         inline=False
                     )

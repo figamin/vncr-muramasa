@@ -8,6 +8,9 @@ anime-specific roles based on total anime watching time.
 OVERRIDES PROVIDED:
 ✅ _sync_reward_roles() - Uses anime time for role assignments (core override)
 ✅ _sync_roles_and_notify() - Also tells the consequences cog after each log/undo
+✅ log_undo + Undo Log button - Admins can undo other members' logs
+✅ log_anime - Blocked for members with the logging-ban role (LOG_BAN_ROLE_ID)
+✅ manage_anime_time - Admins give or remove a member's anime watch time
 ✅ profile - Shows anime-focused immersion profile
 ✅ Helper methods for anime class progress display
 
@@ -27,7 +30,7 @@ from discord import app_commands
 from datetime import datetime, timezone, timedelta
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, Union, List, Tuple
 import logging
 import asyncio
 
@@ -40,12 +43,20 @@ from cogs.immersion import (
     DEFAULT_SPECIAL_RANK_ROLES,
     ANIME_CLASS_ROLE_DEFINITIONS,
     UndoLogButton,
+    DATE_FORMAT_HELP,
+    _format_duration_value,
     _format_hours_display,
 )
 from utils.database import Database
 from utils.immersion_repository import ActivityRepository, GoalRepository, UserRepository
 from utils.immersion_services import UserTimeService, GoalService, GuildRepository
 from utils.immersion_media import MediaSearcher
+from utils.immersion_models import Activity, ActivityType, MediaType
+
+# Members with this role can't use /log_anime (the only command that logs anime)
+LOG_BAN_ROLE_ID = 1570445186394226709
+LOG_BAN_MESSAGE = "Uh oh! It seems like you've been naughty and aren't allowed to use the log command."
+
 
 class ImmersionCog(ParentImmersionCog):
     """Extended immersion cog with anime-focused role progression"""
@@ -112,6 +123,253 @@ class ImmersionCog(ParentImmersionCog):
         if interaction is not None and interaction.guild is not None and actor is not None:
             self.bot.dispatch("anime_log_changed", interaction.guild, actor)
         return await super()._sync_roles_and_notify(interaction, source, actor)
+
+    # ---------------- logging ban ----------------
+
+    @staticmethod
+    def _is_banned_from_logging(member: Union[discord.Member, discord.User]) -> bool:
+        return any(role.id == LOG_BAN_ROLE_ID for role in getattr(member, "roles", []))
+
+    # Same name, options and autocomplete as the parent's /log_anime (keep them in step);
+    # it only adds the ban check before handing over to the parent command.
+    @app_commands.command(name="log_anime", description="Log anime watching")
+    @app_commands.describe(
+        name="Name of the anime",
+        episodes="Number of episodes watched",
+        episode_duration="Duration per episode in minutes (default: 24)",
+        date=DATE_FORMAT_HELP,
+        comment="Optional comment or note about this log entry"
+    )
+    @app_commands.autocomplete(date=ParentImmersionCog._date_autocomplete)
+    async def log_anime(self, interaction: discord.Interaction, name: str,
+                        episodes: int, episode_duration: int = 24, date: str = None, comment: str = None):
+        """Log anime watching, unless the member has the logging-ban role."""
+        if self._is_banned_from_logging(interaction.user):
+            await interaction.response.send_message(LOG_BAN_MESSAGE, ephemeral=True)
+            return
+        await ParentImmersionCog.log_anime.callback(
+            self, interaction, name, episodes, episode_duration, date, comment
+        )
+
+    # ---------------- undoing logs: admins can undo anyone's ----------------
+
+    @staticmethod
+    def _is_log_admin(member: Union[discord.Member, discord.User]) -> bool:
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and perms.administrator)
+
+    def _can_undo_log(self, member: Union[discord.Member, discord.User], owner_id: int) -> bool:
+        """The Undo Log button works for the log's owner and for admins."""
+        return super()._can_undo_log(member, owner_id) or self._is_log_admin(member)
+
+    @app_commands.command(name="log_undo", description="Undo your last activity (admins can undo anyone's)")
+    @app_commands.describe(
+        activity_id="Specific activity ID to undo (optional; admins can use anyone's)",
+        user="Admins only: undo this member's most recent log",
+    )
+    async def log_undo(
+        self,
+        interaction: discord.Interaction,
+        activity_id: Optional[int] = None,
+        user: Optional[discord.Member] = None,
+    ):
+        """Undo your own last log, or (admins) another member's log."""
+        try:
+            await interaction.response.defer()
+
+            caller = interaction.user
+            is_admin = self._is_log_admin(caller)
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            target = user or caller
+            activity = None
+            failure = None
+
+            if target.id != caller.id and not is_admin:
+                failure = "Only admins can undo other members' logs."
+            elif activity_id:
+                activity = await self.activity_repo.get_activity_by_id(activity_id)
+                if (
+                    activity is None
+                    or (str(activity.user_id) != str(caller.id) and not is_admin)
+                    or (user is not None and str(activity.user_id) != str(user.id))
+                ):
+                    failure = "Activity not found or you don't have permission to undo it."
+            else:
+                activity = await self.activity_repo.get_latest_activity(str(target.id), guild_id)
+                if activity is None:
+                    who = "You don't" if target.id == caller.id else f"{target.display_name} doesn't"
+                    embed = discord.Embed(
+                        title="No Logs to Undo",
+                        description=f"{who} have any recent logs to undo.",
+                        color=discord.Color.blue(),
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+
+            success = False
+            if failure is None:
+                owner_id = str(activity.user_id)
+                success = await self.activity_repo.delete_activity(activity.id, owner_id)
+                if not success:
+                    failure = "Failed to undo the activity."
+
+            if failure:
+                embed = discord.Embed(title="Undo Failed", description=failure, color=discord.Color.red())
+                await interaction.followup.send(embed=embed)
+                return
+
+            await self.goal_service.refresh_user_goals(owner_id)
+            description = f"Removed: {activity.name} ({_format_duration_value(activity.duration)})"
+            if owner_id != str(caller.id):
+                description += f"\nLogged by <@{owner_id}>, undone by {caller.mention}"
+            embed = discord.Embed(title="Activity Undone", description=description, color=discord.Color.green())
+            await interaction.followup.send(embed=embed)
+
+            # Role sync and penalty/reward checks are about the log's owner
+            owner = interaction.guild.get_member(int(owner_id)) if interaction.guild else None
+            await self._sync_roles_and_notify(
+                interaction,
+                source="activity_undo",
+                actor=owner or caller,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in log_undo command: {e}")
+            await interaction.followup.send("An error occurred while undoing the activity.", ephemeral=True)
+
+    # ---------------- admins: give or remove anime watch time ----------------
+
+    async def _remove_anime_time(self, user_id: str, seconds: int) -> Tuple[int, List[str]]:
+        """Take `seconds` off the member's most recent anime logs, newest first: logs that
+        are used up are removed (soft delete, like an undo) and the last one is shortened.
+        Returns (seconds actually removed, description of each changed log)."""
+        import aiosqlite
+
+        removed, changed, guilds = 0, [], set()
+        async with aiosqlite.connect(self.db.db_path) as db:
+            async with db.execute(
+                "SELECT id, guild_id, name, duration FROM immersion_activities "
+                "WHERE user_id = ? AND media_type = 'anime' AND deleted_at IS NULL AND duration > 0 "
+                "ORDER BY date DESC, id DESC",
+                (user_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for activity_id, guild_id, name, duration in rows:
+                if removed >= seconds:
+                    break
+                take = min(duration, seconds - removed)
+                if take == duration:
+                    await db.execute(
+                        "UPDATE immersion_activities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (activity_id,),
+                    )
+                    changed.append(f"`{activity_id}` {name}: removed ({_format_duration_value(duration)})")
+                else:
+                    await db.execute(
+                        "UPDATE immersion_activities SET duration = ? WHERE id = ?",
+                        (duration - take, activity_id),
+                    )
+                    changed.append(
+                        f"`{activity_id}` {name}: {_format_duration_value(duration)} → "
+                        f"{_format_duration_value(duration - take)}"
+                    )
+                removed += take
+                guilds.add(guild_id)
+            await db.commit()
+        for guild_id in guilds:
+            self.activity_repo.invalidate_user_cache(user_id, guild_id)
+        return removed, changed
+
+    @app_commands.command(name="manage_anime_time", description="[ADMIN] Give or remove anime watch time for a member")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        action="Give or remove time",
+        user="The member whose anime watch time changes",
+        amount="How much, e.g. 30m, 1h30m, 1.5h, or 90 (minutes)",
+        reason="Optional note, saved with the added time",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Give", value="give"),
+        app_commands.Choice(name="Remove", value="remove"),
+    ])
+    async def manage_anime_time(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        user: discord.Member,
+        amount: str,
+        reason: Optional[str] = None,
+    ):
+        """Give time as a new anime log, or remove time from the member's latest anime logs."""
+        if not self._is_log_admin(interaction.user):
+            await interaction.response.send_message("You need administrator permission for this.", ephemeral=True)
+            return
+        if user.bot:
+            await interaction.response.send_message("Bots don't have watch time.", ephemeral=True)
+            return
+        try:
+            seconds = self._parse_duration(amount.strip())
+        except ValueError:
+            seconds = 0
+        if seconds <= 0:
+            await interaction.response.send_message(
+                "Please give an amount like 30m, 1h30m, 1.5h, or 90 (minutes).", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            user_id = str(user.id)
+            if action.value == "give":
+                activity = Activity(
+                    user_id=user_id,
+                    guild_id=str(interaction.guild_id),
+                    name="Watch time added by an admin",
+                    primary_type=ActivityType.LISTENING.value,
+                    media_type=MediaType.ANIME.value,
+                    duration=seconds,
+                    date=datetime.now(timezone.utc),
+                    meta={"admin_adjustment": True, "admin_id": str(interaction.user.id)},
+                    comment=reason,
+                )
+                activity_id = await self.activity_repo.create_activity(activity)
+                if not activity_id:
+                    await interaction.followup.send("❌ Couldn't add the time. Check the bot logs.", ephemeral=True)
+                    return
+                reply = (
+                    f"✅ Gave {user.mention} {_format_duration_value(seconds)} of anime watch time "
+                    f"(log ID `{activity_id}`). To take it back: `/log_undo activity_id:{activity_id}`."
+                )
+            else:
+                removed, changed = await self._remove_anime_time(user_id, seconds)
+                if removed == 0:
+                    await interaction.followup.send(f"{user.mention} has no anime watch time to remove.", ephemeral=True)
+                    return
+                reply = f"✅ Removed {_format_duration_value(removed)} of anime watch time from {user.mention}"
+                if removed < seconds:
+                    reply += f" (that was all they had; you asked for {_format_duration_value(seconds)})"
+                shown = "\n".join(f"• {line}" for line in changed[:15])
+                if len(changed) > 15:
+                    shown += f"\n• …and {len(changed) - 15} more"
+                reply += f".\nLogs changed, newest first:\n{shown}"
+            logger.info(
+                f"[Anime time] {interaction.user} ({interaction.user.id}) {action.value} "
+                f"{seconds}s for {user} ({user.id}); reason: {reason!r}"
+            )
+            await interaction.followup.send(reply, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            logger.error(f"Error in manage_anime_time: {e}")
+            await interaction.followup.send("An error occurred while changing the watch time.", ephemeral=True)
+            return
+
+        # The time has changed: goals, class roles and the penalty/reward checks follow
+        # the new total. A failure here is only logged, so it can't hide the success above.
+        try:
+            await self.goal_service.refresh_user_goals(user_id)
+            await self._sync_roles_and_notify(interaction, source="admin_time", actor=user)
+        except Exception as e:
+            logger.error(f"Error updating roles/goals after manage_anime_time: {e}")
 
     async def _sync_reward_roles(self, guild: discord.Guild, source: str) -> Dict[str, int]:
         """
@@ -587,6 +845,7 @@ class ImmersionCog(ParentImmersionCog):
             "activity_log": "after your latest log.",
             "activity_undo": "after undoing a log.",
             "manual": "after a manual sync.",
+            "admin_time": "after an admin changed your anime watch time.",
         }
         trigger_phrase = trigger_map.get(source, "after your recent activity.")
 
