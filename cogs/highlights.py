@@ -393,11 +393,17 @@ class HighlightsCog(commands.Cog):
         perms = channel.permissions_for(guild.me)
         return [label for label, attr in required if not getattr(perms, attr, False)]
 
-    async def _check_and_highlight_message(self, message: discord.Message, ignore_enabled: bool = False):
+    async def _check_and_highlight_message(
+        self,
+        message: discord.Message,
+        ignore_enabled: bool = False,
+        max_age_days: Optional[int] = None,
+    ):
         """Check if a message should be highlighted and post it if so.
 
         ``ignore_enabled`` is used by the repair scan: an admin explicitly asked
         for a backfill, even though live highlighting may still be switched off.
+        ``max_age_days`` overrides the default eligibility window for that scan.
         """
         # Use a lock for this specific message to prevent race conditions
         async with self._get_message_lock(message.id):
@@ -438,9 +444,11 @@ class HighlightsCog(commands.Cog):
                 if getattr(message.channel, 'name', '').lower() in excluded_channels:
                     return
 
-                # Don't highlight messages older than MESSAGE_MAX_AGE_DAYS
+                # Don't highlight messages older than the window (default 30 days;
+                # a backfill may widen it explicitly).
+                window_days = max_age_days if max_age_days is not None else self.MESSAGE_MAX_AGE_DAYS
                 message_age = datetime.now(timezone.utc) - message.created_at
-                if message_age > timedelta(days=self.MESSAGE_MAX_AGE_DAYS):
+                if message_age > timedelta(days=window_days):
                     return
 
                 # Determine the effective poster. The bot's webhook reposts (word filter /
@@ -670,10 +678,17 @@ class HighlightsCog(commands.Cog):
             )
         return found
 
-    async def _backfill_guild(self, guild: discord.Guild, ignore_enabled: bool = False) -> dict:
+    async def _backfill_guild(
+        self,
+        guild: discord.Guild,
+        ignore_enabled: bool = False,
+        days: Optional[int] = None,
+    ) -> dict:
         """Scan a guild's recent messages and post any highlight that was missed."""
+        window_days = days if days is not None else self.MESSAGE_MAX_AGE_DAYS
         stats = {
             'guild_id': guild.id,
+            'days': window_days,
             'channels_scanned': 0,
             'channels_skipped': [],
             'messages_scanned': 0,
@@ -706,7 +721,7 @@ class HighlightsCog(commands.Cog):
             logger.error("Highlights backfill: %s (guild %s)", stats['error'], guild.id)
             return stats
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.MESSAGE_MAX_AGE_DAYS)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
         threshold = self._get_reaction_threshold(guild.id)
 
         # Read the highlights channel first: this is both the duplicate guard and
@@ -772,7 +787,9 @@ class HighlightsCog(commands.Cog):
 
                     stats['candidates'] += 1
                     await self._check_and_highlight_message(
-                        message, ignore_enabled=ignore_enabled
+                        message,
+                        ignore_enabled=ignore_enabled,
+                        max_age_days=window_days,
                     )
                     if message.id in self.highlighted_messages:
                         stats['posted'] += 1
@@ -786,9 +803,10 @@ class HighlightsCog(commands.Cog):
         # Persist the ids recovered from the highlights channel as well as new ones.
         self._save_highlighted_messages()
         logger.info(
-            "Highlights backfill done for guild %s: %d channel(s), %d message(s), "
-            "%d candidate(s), %d posted",
+            "Highlights backfill done for guild %s (last %d days): %d channel(s), "
+            "%d message(s), %d candidate(s), %d posted",
             guild.id,
+            window_days,
             stats['channels_scanned'],
             stats['messages_scanned'],
             stats['candidates'],
@@ -800,6 +818,7 @@ class HighlightsCog(commands.Cog):
         self,
         force: bool = False,
         guild: Optional[discord.Guild] = None,
+        days: Optional[int] = None,
     ) -> Optional[list]:
         """Repair highlights that were missed while the bot was not working.
 
@@ -846,7 +865,9 @@ class HighlightsCog(commands.Cog):
                 logger.info(
                     "Highlights backfill: scanning guild %s (%s)", target.id, target.name
                 )
-                stats = await self._backfill_guild(target, ignore_enabled=manual)
+                stats = await self._backfill_guild(
+                    target, ignore_enabled=manual, days=days
+                )
                 results.append(stats)
 
                 if stats.get('error'):
@@ -869,12 +890,22 @@ class HighlightsCog(commands.Cog):
         except Exception:
             logger.exception("Highlights backfill: one-time scan failed")
 
-    async def _highlights_backfill(self, interaction: discord.Interaction):
+    async def _highlights_backfill(self, interaction: discord.Interaction, days: Optional[int] = None):
         """Manually re-run the repair scan for this guild.
 
+        ``days`` is how many days of history to scan. It also raises the
+        eligibility window for that scan, so messages older than the normal
+        30-day limit can still be repaired when an admin asks for them.
         The scan can outlive Discord's 15-minute interaction token, so it runs as a
         background task and the summary is delivered when it finishes.
         """
+        window_days = days if days is not None else self.MESSAGE_MAX_AGE_DAYS
+        if window_days < 1 or window_days > 3650:
+            await interaction.response.send_message(
+                "❌ Days must be between 1 and 3650.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
 
         if self._backfill_lock.locked():
@@ -886,23 +917,22 @@ class HighlightsCog(commands.Cog):
 
         await self._send_followup_safe(
             interaction,
-            "🧹 Backfill scan started. It reads up to "
-            f"{self.MESSAGE_MAX_AGE_DAYS} days of history, so it can take a while. "
-            "The summary will be posted when it finishes.",
+            f"🧹 Backfill scan started for the last **{window_days} days** of history. "
+            "This can take a while; the summary will be posted when it finishes.",
         )
 
         task = asyncio.create_task(
-            self._run_manual_backfill(interaction),
+            self._run_manual_backfill(interaction, window_days),
             name=f"highlights-backfill-{interaction.guild_id}",
         )
         self._backfill_tasks.add(task)
         task.add_done_callback(self._backfill_tasks.discard)
 
-    async def _run_manual_backfill(self, interaction: discord.Interaction):
+    async def _run_manual_backfill(self, interaction: discord.Interaction, days: Optional[int] = None):
         """Run the manual scan and deliver its summary, even if the token expired."""
         try:
             results = await self._backfill_missed_highlights(
-                force=True, guild=interaction.guild
+                force=True, guild=interaction.guild, days=days
             )
         except Exception:
             logger.exception("Highlights backfill: manual scan failed")
@@ -935,6 +965,7 @@ class HighlightsCog(commands.Cog):
 
     def _build_backfill_report(self, interaction: discord.Interaction, stats: dict) -> discord.Embed:
         lines = [
+            f"Window: last **{stats.get('days', self.MESSAGE_MAX_AGE_DAYS)} days**",
             f"Channels scanned: **{stats['channels_scanned']}**",
             f"Messages scanned: **{stats['messages_scanned']}**",
             f"Messages that met the reaction count: **{stats['candidates']}**",
@@ -1003,7 +1034,8 @@ class HighlightsCog(commands.Cog):
         action="What to do.",
         channel="(setup) The channel where highlighted messages will be posted.",
         threshold="(setup) Number of unique reactors needed to highlight a message.",
-        enabled="(setup) Enable or disable the highlights feature."
+        enabled="(setup) Enable or disable the highlights feature.",
+        days="(backfill) How many days of history to scan. Defaults to 30."
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="setup", value="setup"),
@@ -1020,14 +1052,15 @@ class HighlightsCog(commands.Cog):
         action: str,
         channel: Optional[discord.TextChannel] = None,
         threshold: Optional[int] = None,
-        enabled: Optional[bool] = None
+        enabled: Optional[bool] = None,
+        days: Optional[int] = None
     ):
         if action == "status":
             await self._highlights_status(interaction)
         elif action == "test":
             await self._highlights_test(interaction)
         elif action == "backfill":
-            await self._highlights_backfill(interaction)
+            await self._highlights_backfill(interaction, days)
         else:
             await self._highlights_setup(interaction, channel, threshold, enabled)
 
@@ -1114,7 +1147,9 @@ class HighlightsCog(commands.Cog):
             name="ℹ️ Reminder",
             value="The message author **and** at least "
                   f"{threshold} unique reactors must have the **Confirmed Reader** role. "
-                  f"Messages older than {self.MESSAGE_MAX_AGE_DAYS} days are ignored.",
+                  f"Messages older than {self.MESSAGE_MAX_AGE_DAYS} days are ignored. "
+                  "The repair scan window can be changed with "
+                  "`/manage_highlights backfill days:<n>`.",
             inline=False,
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1273,13 +1308,18 @@ class HighlightsCog(commands.Cog):
 
         # One-time repair scan status
         completed_at = (self._load_backfill_state().get('completed_guilds') or {}).get(guild_id_str)
+        backfill_text = (
+            f"✅ Completed {completed_at}"
+            if completed_at
+            else "⏳ Not run yet (runs once at startup, or `/manage_highlights backfill`)"
+        )
+        backfill_text += (
+            f"\nWindow: default {self.MESSAGE_MAX_AGE_DAYS} days; override with "
+            "`/manage_highlights backfill days:<n>`."
+        )
         embed.add_field(
             name="🧹 Backfill",
-            value=(
-                f"✅ Completed {completed_at}"
-                if completed_at
-                else "⏳ Not run yet (runs once at startup, or `/manage_highlights backfill`)"
-            ),
+            value=backfill_text,
             inline=False
         )
         
