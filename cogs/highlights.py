@@ -3,18 +3,33 @@ from discord import app_commands
 from discord.ext import commands
 from typing import Optional, Dict, Set
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta, timezone
 import asyncio
 import os
 
 from utils.database import Database
 from utils.message_filter import strip_author_marker
 
+logger = logging.getLogger(__name__)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return an aware UTC datetime, treating naive values as UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 
 class HighlightsCog(commands.Cog):
     """Highlights feature - sends messages with enough unique reactions to a designated channel"""
     
     HIGHLIGHTED_MESSAGES_FILE = 'data/highlighted_messages.json'
+    # Only messages newer than this can be highlighted; the repair scan uses the
+    # same window so it never reads messages that could not be posted anyway.
+    MESSAGE_MAX_AGE_DAYS = 30
+    # Records which guilds already had their repair scan.
+    BACKFILL_MARKER_FILE = 'data/highlights_backfill.json'
     
     def __init__(self, bot):
         self.bot = bot
@@ -24,8 +39,45 @@ class HighlightsCog(commands.Cog):
         self.highlighted_messages: Dict[int, datetime] = {}
         # Lock to prevent race conditions when checking/highlighting messages
         self._highlight_locks: Dict[int, asyncio.Lock] = {}
+        # Channels already warned about for missing permissions (avoid log spam).
+        self._permission_warnings: Set[int] = set()
+        # One-time backfill task and the lock that keeps scans from overlapping.
+        self._backfill_task: Optional[asyncio.Task] = None
+        self._backfill_tasks: Set[asyncio.Task] = set()
+        self._backfill_lock = asyncio.Lock()
         # Load previously highlighted messages from file
         self._load_highlighted_messages()
+
+    async def cog_load(self):
+        """Warn about missing intents and queue the one-time repair scan."""
+        intents = getattr(self.bot, 'intents', None)
+        if intents is not None:
+            if not intents.guild_reactions:
+                logger.error(
+                    "Highlights: the Guild Reactions intent is disabled; "
+                    "reaction events will never be received."
+                )
+            if not intents.members:
+                logger.error(
+                    "Highlights: the Server Members intent is disabled; "
+                    "the 'Confirmed Reader' checks will fail."
+                )
+        logger.info(
+            "Highlights cog loaded (tracking %d previously highlighted messages)",
+            len(self.highlighted_messages),
+        )
+        # Guilds are only available after READY, hence the wait inside the task.
+        self._backfill_task = asyncio.create_task(
+            self._run_backfill_after_ready(),
+            name="highlights-backfill",
+        )
+
+    async def cog_unload(self):
+        if self._backfill_task and not self._backfill_task.done():
+            self._backfill_task.cancel()
+        for task in list(self._backfill_tasks):
+            if not task.done():
+                task.cancel()
         
     def _load_highlighted_messages(self):
         """Load highlighted messages from JSON file"""
@@ -35,14 +87,14 @@ class HighlightsCog(commands.Cog):
                     data = json.load(f)
                     # Convert string keys back to integers and string timestamps to datetime
                     self.highlighted_messages = {
-                        int(msg_id): datetime.fromisoformat(timestamp)
+                        int(msg_id): _as_utc(datetime.fromisoformat(timestamp))
                         for msg_id, timestamp in data.items()
                     }
-                print(f"Loaded {len(self.highlighted_messages)} previously highlighted messages")
+                logger.info("Loaded %d previously highlighted messages", len(self.highlighted_messages))
             else:
-                print("No previous highlighted messages file found, starting fresh")
-        except Exception as e:
-            print(f"Error loading highlighted messages: {e}")
+                logger.info("No previous highlighted messages file found, starting fresh")
+        except Exception:
+            logger.exception("Error loading highlighted messages from %s", self.HIGHLIGHTED_MESSAGES_FILE)
             self.highlighted_messages = {}
     
     def _save_highlighted_messages(self):
@@ -57,13 +109,19 @@ class HighlightsCog(commands.Cog):
                 for msg_id, timestamp in self.highlighted_messages.items()
             }
             
-            with open(self.HIGHLIGHTED_MESSAGES_FILE, 'w') as f:
+            # Write via a temp file so a crash mid-write cannot truncate the history.
+            tmp_path = f"{self.HIGHLIGHTED_MESSAGES_FILE}.tmp"
+            with open(tmp_path, 'w') as f:
                 json.dump(data, f, indent=4)
-        except Exception as e:
-            print(f"Error saving highlighted messages: {e}")
+            os.replace(tmp_path, self.HIGHLIGHTED_MESSAGES_FILE)
+        except Exception:
+            logger.exception("Error saving highlighted messages to %s", self.HIGHLIGHTED_MESSAGES_FILE)
         
     def _get_message_lock(self, message_id: int) -> asyncio.Lock:
         """Get or create a lock for a specific message"""
+        if len(self._highlight_locks) > 5000:
+            for lock_id in [mid for mid, lock in self._highlight_locks.items() if not lock.locked()][:2500]:
+                self._highlight_locks.pop(lock_id, None)
         if message_id not in self._highlight_locks:
             self._highlight_locks[message_id] = asyncio.Lock()
         return self._highlight_locks[message_id]
@@ -71,7 +129,7 @@ class HighlightsCog(commands.Cog):
     def _get_guild_config(self, guild_id: int) -> dict:
         """Get guild configuration"""
         guild_id_str = str(guild_id)
-        return self.bot.config['guilds'].get(guild_id_str, {})
+        return (self.bot.config.get('guilds') or {}).get(guild_id_str, {})
     
     def _is_highlights_enabled(self, guild_id: int) -> bool:
         """Check if highlights feature is enabled for this guild"""
@@ -84,35 +142,86 @@ class HighlightsCog(commands.Cog):
         channel_id = config.get('highlights_channel')
         # Convert to int if stored as string (to handle JSON precision issues)
         if channel_id is not None:
-            return int(channel_id)
+            try:
+                return int(channel_id)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Highlights: invalid highlights_channel value %r for guild %s",
+                    channel_id, guild_id,
+                )
+                return None
         return None
     
     def _get_reaction_threshold(self, guild_id: int) -> int:
         """Get the unique reactor threshold for highlights"""
         config = self._get_guild_config(guild_id)
-        return config.get('highlights_threshold', 5)  # Default to 5 unique reactors
-    
+        try:
+            # The web console can store numbers as strings; comparing
+            # len(...) >= "5" raised TypeError and silently disabled highlights.
+            return max(1, int(config.get('highlights_threshold', 5)))
+        except (TypeError, ValueError):
+            return 5
+
+    def _get_confirmed_reader_role(self, guild: discord.Guild) -> Optional[discord.Role]:
+        """Return the guild's Confirmed Reader role, if it exists"""
+        return discord.utils.get(guild.roles, name="Confirmed Reader")
+
+    def _resolve_configured_channel(self, guild: discord.Guild, channel_id) -> Optional[discord.abc.GuildChannel]:
+        """Resolve the configured highlights channel, tolerating a string/invalid id"""
+        try:
+            return guild.get_channel(int(channel_id))
+        except (TypeError, ValueError):
+            return None
+
     def _has_confirmed_reader_role(self, member: discord.Member) -> bool:
         """Check if a member has the Confirmed Reader role"""
         if not member:
             return False
-        confirmed_reader_role = discord.utils.get(member.guild.roles, name="Confirmed Reader")
+        confirmed_reader_role = self._get_confirmed_reader_role(member.guild)
         if not confirmed_reader_role:
             return False
         return confirmed_reader_role in member.roles
+
+    async def _resolve_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+        """Resolve a member from cache, falling back to an API fetch."""
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("Highlights: could not fetch member %s in guild %s: %s", user_id, guild.id, exc)
+            return None
     
     async def _count_unique_reactors(self, message: discord.Message) -> Set[int]:
-        """Count unique users who reacted to a message (excluding bots and users without Confirmed Reader)"""
+        """Count unique users who reacted to a message (excluding bots and non-readers)"""
         unique_reactors = set()
         
         for reaction in message.reactions:
-            async for user in reaction.users():
+            try:
+                users = [user async for user in reaction.users()]
+            except discord.Forbidden:
+                logger.error(
+                    "Highlights: missing 'Read Message History' in #%s (guild %s); "
+                    "cannot read reactors on message %s",
+                    getattr(message.channel, 'name', message.channel.id),
+                    message.guild.id,
+                    message.id,
+                )
+                continue
+            except discord.HTTPException as exc:
+                logger.warning("Highlights: failed to read reactors on message %s: %s", message.id, exc)
+                continue
+
+            for user in users:
                 # Skip bots
                 if user.bot:
                     continue
                 
                 # Check if user has Confirmed Reader role
-                member = message.guild.get_member(user.id)
+                member = await self._resolve_member(message.guild, user.id)
                 if member and self._has_confirmed_reader_role(member):
                     unique_reactors.add(user.id)
         
@@ -273,16 +382,11 @@ class HighlightsCog(commands.Cog):
         
         # Add footer with channel and stats
         reactor_text = "unique reactor" if reactor_count == 1 else "unique reactors"
-        footer_text = f"#{message.channel.name} • {reactor_count} {reactor_text}"
+        footer_text = f"#{getattr(message.channel, 'name', 'unknown')} • {reactor_count} {reactor_text}"
         embed.set_footer(text=footer_text)
         
         return embed
-    
-    async def _check_and_highlight_message(self, message: discord.Message):
-        """Check if a message should be highlighted and post it if so"""
-        # Use a lock for this specific message to prevent race conditions
-        async with self._get_message_lock(message.id):
-            try:
+
     @staticmethod
     def _missing_channel_permissions(channel, guild, required) -> list:
         """Return human-readable names of permissions the bot lacks in a channel"""
@@ -351,101 +455,133 @@ class HighlightsCog(commands.Cog):
                     effective_author_id = repost_author_id
 
                 # Check if the (effective) author has the Confirmed Reader role
-                author_member = message.guild.get_member(effective_author_id)
+                author_member = await self._resolve_member(guild, effective_author_id)
                 if not author_member or not self._has_confirmed_reader_role(author_member):
+                    logger.debug(
+                        "Highlights: author %s of message %s is not a Confirmed Reader",
+                        effective_author_id, message.id,
+                    )
                     return
-                
-                # Check if highlights is enabled
-                if not self._is_highlights_enabled(message.guild.id):
-                    return
-                
-                # Get highlights channel
-                highlights_channel_id = self._get_highlights_channel_id(message.guild.id)
-                if not highlights_channel_id:
-                    return
-                
-                highlights_channel = message.guild.get_channel(highlights_channel_id)
-                if not highlights_channel:
-                    return
-                
-                # Check if message was already highlighted
-                if message.id in self.highlighted_messages:
-                    return
-                
-                # Don't highlight messages from the highlights channel itself
-                if message.channel.id == highlights_channel_id:
-                    return
-                
-                # Don't highlight messages from excluded channels
-                excluded_channels = ["announcements", "rules-info", "resources"]
-                if message.channel.name.lower() in excluded_channels:
-                    return
-                
-                # Don't highlight messages older than 7 days
-                from datetime import datetime, timedelta, timezone
-                message_age = datetime.now(timezone.utc) - message.created_at
-                if message_age > timedelta(days=7):
-                    return
-                
+
                 # Count unique reactors with Confirmed Reader role
                 unique_reactors = await self._count_unique_reactors(message)
-                threshold = self._get_reaction_threshold(message.guild.id)
-                
-                # Check if threshold is met
-                if len(unique_reactors) >= threshold:
-                    # Mark as highlighted BEFORE sending to prevent duplicates
-                    self.highlighted_messages[message.id] = datetime.now()
-                    # Save to file immediately to persist across restarts
-                    self._save_highlighted_messages()
-                    print(f"Marking message {message.id} as highlighted")
-                    
-                    # Create and send embed with button
-                    embed = await self._create_highlight_embed(
-                        message,
-                        len(unique_reactors)
+                threshold = self._get_reaction_threshold(guild.id)
+                if len(unique_reactors) < threshold:
+                    logger.debug(
+                        "Highlights: message %s has %d/%d confirmed readers",
+                        message.id, len(unique_reactors), threshold,
                     )
-                    
-                    # Create a view with a button linking to the original message
-                    view = discord.ui.View()
-                    button = discord.ui.Button(
-                        label="Jump to Message",
-                        style=discord.ButtonStyle.link,
-                        url=message.jump_url,
-                        emoji="💬"
+                    return
+
+                # Fail with a useful log instead of a generic exception when the
+                # bot cannot actually post in the configured channel.
+                missing = self._missing_channel_permissions(
+                    highlights_channel,
+                    guild,
+                    (("Send Messages", "send_messages"), ("Embed Links", "embed_links")),
+                )
+                if missing:
+                    logger.error(
+                        "Highlights: bot is missing %s in #%s (guild %s); message %s was not posted",
+                        ", ".join(missing),
+                        getattr(highlights_channel, 'name', highlights_channel_id),
+                        guild.id,
+                        message.id,
                     )
-                    view.add_item(button)
-                    
-                    await highlights_channel.send(embed=embed, view=view)
-                    
-                    print(f"Successfully highlighted message {message.id} with {len(unique_reactors)} unique reactors")
-                    
-            except Exception as e:
-                print(f"Error checking/highlighting message: {e}")
+                    return
+
+                # Create and send embed with button
+                embed = await self._create_highlight_embed(
+                    message,
+                    len(unique_reactors)
+                )
+
+                # Create a view with a button linking to the original message
+                view = discord.ui.View()
+                button = discord.ui.Button(
+                    label="Jump to Message",
+                    style=discord.ButtonStyle.link,
+                    url=message.jump_url,
+                    emoji="💬"
+                )
+                view.add_item(button)
+
+                try:
+                    await highlights_channel.send(
+                        embed=embed,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    # Do NOT mark it: a failed send must be retryable.
+                    logger.exception(
+                        "Highlights: failed to post message %s to #%s (guild %s)",
+                        message.id,
+                        getattr(highlights_channel, 'name', highlights_channel_id),
+                        guild.id,
+                    )
+                    return
+
+                # Mark as highlighted only after the message was actually sent.
+                self.highlighted_messages[message.id] = datetime.now(timezone.utc)
+                self._save_highlighted_messages()
+                logger.info(
+                    "Highlighted message %s from #%s (guild %s) with %d unique reactors",
+                    message.id,
+                    getattr(message.channel, 'name', message.channel.id),
+                    guild.id,
+                    len(unique_reactors),
+                )
+
+            except Exception:
+                logger.exception("Error checking/highlighting message %s", message.id)
     
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         """Handle when a reaction is added to a message"""
         try:
+            if payload.guild_id is None:
+                return
             # Get the guild
             guild = self.bot.get_guild(payload.guild_id)
             if not guild:
                 return
-            
+
             # Get the channel and message
-            channel = guild.get_channel(payload.channel_id)
+            channel = guild.get_channel(payload.channel_id) or guild.get_thread(payload.channel_id)
             if not channel:
                 return
-            
+
+            # fetch_message()/reaction.users() need Read Message History. Without it
+            # the handler used to bail out silently, so warn once per channel.
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                if payload.channel_id not in self._permission_warnings:
+                    self._permission_warnings.add(payload.channel_id)
+                    logger.error(
+                        "Highlights: bot lacks View Channel / Read Message History in #%s "
+                        "(guild %s); reactions there cannot be evaluated",
+                        getattr(channel, 'name', payload.channel_id),
+                        guild.id,
+                    )
+                return
+
             try:
                 message = await channel.fetch_message(payload.message_id)
-            except (discord.NotFound, discord.Forbidden):
+            except discord.NotFound:
                 return
-            
+            except discord.Forbidden:
+                logger.warning(
+                    "Highlights: forbidden while fetching message %s in channel %s",
+                    payload.message_id, payload.channel_id,
+                )
+                return
+
             # Check if this message should be highlighted
             await self._check_and_highlight_message(message)
-            
-        except Exception as e:
-            print(f"Error in on_raw_reaction_add: {e}")
+
+        except Exception:
+            logger.exception("Error in on_raw_reaction_add for message %s", payload.message_id)
     
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -734,31 +870,70 @@ class HighlightsCog(commands.Cog):
             logger.exception("Highlights backfill: one-time scan failed")
 
     async def _highlights_backfill(self, interaction: discord.Interaction):
-        """Manually re-run the repair scan for this guild."""
+        """Manually re-run the repair scan for this guild.
+
+        The scan can outlive Discord's 15-minute interaction token, so it runs as a
+        background task and the summary is delivered when it finishes.
+        """
         await interaction.response.defer(ephemeral=True)
-        results = await self._backfill_missed_highlights(force=True, guild=interaction.guild)
+
+        if self._backfill_lock.locked():
+            await self._send_followup_safe(
+                interaction,
+                "⏳ A backfill scan is already running. Try again when it finishes.",
+            )
+            return
+
+        await self._send_followup_safe(
+            interaction,
+            "🧹 Backfill scan started. It reads up to "
+            f"{self.MESSAGE_MAX_AGE_DAYS} days of history, so it can take a while. "
+            "The summary will be posted when it finishes.",
+        )
+
+        task = asyncio.create_task(
+            self._run_manual_backfill(interaction),
+            name=f"highlights-backfill-{interaction.guild_id}",
+        )
+        self._backfill_tasks.add(task)
+        task.add_done_callback(self._backfill_tasks.discard)
+
+    async def _run_manual_backfill(self, interaction: discord.Interaction):
+        """Run the manual scan and deliver its summary, even if the token expired."""
+        try:
+            results = await self._backfill_missed_highlights(
+                force=True, guild=interaction.guild
+            )
+        except Exception:
+            logger.exception("Highlights backfill: manual scan failed")
+            results = None
 
         if results is None:
-            await interaction.followup.send(
-                "⏳ A backfill scan is already running. Try again in a moment.",
-                ephemeral=True,
+            embed = discord.Embed(
+                title="🧹 Highlight backfill",
+                description="Another scan started first; nothing was done.",
+                color=discord.Color.orange(),
             )
-            return
-        if not results:
-            await interaction.followup.send(
-                "ℹ️ Nothing to scan for this server.",
-                ephemeral=True,
+        elif not results:
+            embed = discord.Embed(
+                title="🧹 Highlight backfill",
+                description="Nothing to scan for this server.",
+                color=discord.Color.orange(),
             )
-            return
+        else:
+            stats = results[0]
+            if stats.get('error'):
+                embed = discord.Embed(
+                    title="🧹 Highlight backfill failed",
+                    description=f"❌ {stats['error']}",
+                    color=discord.Color.red(),
+                )
+            else:
+                embed = self._build_backfill_report(interaction, stats)
 
-        stats = results[0]
-        if stats.get('error'):
-            await interaction.followup.send(
-                f"❌ Backfill could not run: {stats['error']}",
-                ephemeral=True,
-            )
-            return
+        await self._deliver_backfill_report(interaction, embed)
 
+    def _build_backfill_report(self, interaction: discord.Interaction, stats: dict) -> discord.Embed:
         lines = [
             f"Channels scanned: **{stats['channels_scanned']}**",
             f"Messages scanned: **{stats['messages_scanned']}**",
@@ -777,16 +952,53 @@ class HighlightsCog(commands.Cog):
                 "repair posts; enable live highlighting with "
                 "`/manage_highlights setup enabled:true`."
             )
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="🧹 Highlight backfill complete",
-                description="\n".join(lines),
-                color=discord.Color.green(),
-            ),
-            ephemeral=True,
+        return discord.Embed(
+            title="🧹 Highlight backfill complete",
+            description="\n".join(lines),
+            color=discord.Color.green(),
         )
+
+    async def _deliver_backfill_report(self, interaction: discord.Interaction, embed: discord.Embed):
+        """Deliver the summary without raising if the interaction token has expired."""
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        except (discord.NotFound, discord.HTTPException) as exc:
+            # 50027 "Invalid Webhook Token" means the 15-minute window closed while
+            # a long scan was running. That is expected, not a command failure.
+            logger.warning(
+                "Highlights backfill: interaction token no longer usable (%s); "
+                "posting the summary in the channel instead", exc,
+            )
+        except Exception:
+            logger.exception("Highlights backfill: could not deliver the summary")
+
+        channel = interaction.channel
+        if channel is not None:
+            try:
+                await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            except Exception:
+                logger.exception("Highlights backfill: could not post the summary in the channel")
+
+        logger.info(
+            "Highlights backfill summary (guild %s): %s",
+            getattr(interaction, 'guild_id', '?'),
+            getattr(embed, 'description', ''),
+        )
+
+    @staticmethod
+    async def _send_followup_safe(interaction: discord.Interaction, content: str):
+        """Best-effort interaction reply; an expired token is logged, not raised."""
+        try:
+            await interaction.followup.send(content, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException) as exc:
+            logger.warning("Highlights: could not reply to the interaction: %s", exc)
     
-    @app_commands.command(name="manage_highlights", description="[ADMIN] Configure or view the highlights feature")
+    @app_commands.command(name="manage_highlights", description="[ADMIN] Configure, view, test or repair the highlights feature")
     @app_commands.describe(
         action="What to do.",
         channel="(setup) The channel where highlighted messages will be posted.",
@@ -796,6 +1008,8 @@ class HighlightsCog(commands.Cog):
     @app_commands.choices(action=[
         app_commands.Choice(name="setup", value="setup"),
         app_commands.Choice(name="status", value="status"),
+        app_commands.Choice(name="test", value="test"),
+        app_commands.Choice(name="backfill", value="backfill"),
     ])
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
@@ -810,8 +1024,100 @@ class HighlightsCog(commands.Cog):
     ):
         if action == "status":
             await self._highlights_status(interaction)
+        elif action == "test":
+            await self._highlights_test(interaction)
+        elif action == "backfill":
+            await self._highlights_backfill(interaction)
         else:
             await self._highlights_setup(interaction, channel, threshold, enabled)
+
+    async def _highlights_test(self, interaction: discord.Interaction):
+        """Run a self-check and post a sample highlight to the configured channel."""
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        lines = []
+
+        intents = self.bot.intents
+        lines.append(
+            f"{'✅' if intents.guild_reactions else '❌'} Guild Reactions intent "
+            f"(required for highlight detection)"
+        )
+        lines.append(
+            f"{'✅' if intents.members else '❌'} Server Members intent "
+            f"(required for Confirmed Reader checks)"
+        )
+
+        enabled = self._is_highlights_enabled(guild.id)
+        lines.append(f"{'✅' if enabled else '❌'} Feature enabled")
+
+        role = self._get_confirmed_reader_role(guild)
+        if role:
+            lines.append(f"✅ Role 'Confirmed Reader' exists ({len(role.members)} members)")
+        else:
+            lines.append("❌ Role 'Confirmed Reader' does not exist")
+
+        threshold = self._get_reaction_threshold(guild.id)
+        lines.append(f"ℹ️ Threshold: {threshold} unique reactors")
+
+        channel_id = self._get_highlights_channel_id(guild.id)
+        highlights_channel = guild.get_channel(channel_id) if channel_id else None
+        if not channel_id:
+            lines.append("❌ No highlights channel configured")
+        elif not highlights_channel:
+            lines.append(f"❌ Highlights channel {channel_id} not found in this guild")
+        else:
+            missing = self._missing_channel_permissions(
+                highlights_channel,
+                guild,
+                (
+                    ("View Channel", "view_channel"),
+                    ("Send Messages", "send_messages"),
+                    ("Embed Links", "embed_links"),
+                ),
+            )
+            if missing:
+                lines.append(
+                    f"❌ Missing permissions in {highlights_channel.mention}: {', '.join(missing)}"
+                )
+            else:
+                lines.append(f"✅ Bot can post in {highlights_channel.mention}")
+                try:
+                    sample = discord.Embed(
+                        title="🧪 Highlights test",
+                        description="If you can see this, the bot can post highlights here.",
+                        color=discord.Color.gold(),
+                    )
+                    sample.set_footer(text=f"Requested by {interaction.user.display_name}")
+                    await highlights_channel.send(
+                        embed=sample,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    lines.append("✅ Test embed sent")
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    lines.append(f"❌ Test embed failed: {exc}")
+
+        # Reading reactors needs history access wherever people react, not just in
+        # the highlights channel. Report it for the channel the command was used in.
+        if interaction.channel is not None and hasattr(interaction.channel, 'permissions_for'):
+            perms = interaction.channel.permissions_for(guild.me)
+            ok = perms.view_channel and perms.read_message_history
+            lines.append(
+                f"{'✅' if ok else '❌'} Bot can read message history in {interaction.channel.mention}"
+            )
+
+        embed = discord.Embed(
+            title="🧪 Highlights self-check",
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="ℹ️ Reminder",
+            value="The message author **and** at least "
+                  f"{threshold} unique reactors must have the **Confirmed Reader** role. "
+                  f"Messages older than {self.MESSAGE_MAX_AGE_DAYS} days are ignored.",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _highlights_setup(
         self,
@@ -824,6 +1130,7 @@ class HighlightsCog(commands.Cog):
         guild_id_str = str(interaction.guild.id)
         
         # Initialize guild config if it doesn't exist
+        self.bot.config.setdefault('guilds', {})
         if guild_id_str not in self.bot.config['guilds']:
             self.bot.config['guilds'][guild_id_str] = {}
         
@@ -869,7 +1176,7 @@ class HighlightsCog(commands.Cog):
             
             channel_id = guild_config.get('highlights_channel')
             if channel_id:
-                channel_obj = interaction.guild.get_channel(int(channel_id))
+                channel_obj = self._resolve_configured_channel(interaction.guild, channel_id)
                 channel_text = channel_obj.mention if channel_obj else f"Channel ID: {channel_id} (not found)"
             else:
                 channel_text = "Not set"
@@ -880,7 +1187,7 @@ class HighlightsCog(commands.Cog):
                 inline=True
             )
 
-            threshold_value = guild_config.get('highlights_threshold', 5)
+            threshold_value = self._get_reaction_threshold(interaction.guild.id)
             embed.add_field(
                 name="Reaction Threshold",
                 value=f"{threshold_value} unique reactors",
@@ -913,7 +1220,7 @@ class HighlightsCog(commands.Cog):
     async def _highlights_status(self, interaction: discord.Interaction):
         """Show current highlights configuration"""
         guild_id_str = str(interaction.guild.id)
-        guild_config = self.bot.config['guilds'].get(guild_id_str, {})
+        guild_config = (self.bot.config.get('guilds') or {}).get(guild_id_str, {})
         
         embed = discord.Embed(
             title="📋 Highlights Configuration",
@@ -931,7 +1238,7 @@ class HighlightsCog(commands.Cog):
         # Channel
         channel_id = guild_config.get('highlights_channel')
         if channel_id:
-            channel_obj = interaction.guild.get_channel(int(channel_id))
+            channel_obj = self._resolve_configured_channel(interaction.guild, channel_id)
             channel_text = channel_obj.mention if channel_obj else f"Channel ID: {channel_id} (not found)"
         else:
             channel_text = "Not set"
@@ -943,7 +1250,7 @@ class HighlightsCog(commands.Cog):
         )
         
         # Threshold
-        threshold_value = guild_config.get('highlights_threshold', 5)
+        threshold_value = self._get_reaction_threshold(interaction.guild.id)
         embed.add_field(
             name="Reaction Threshold",
             value=f"{threshold_value} unique reactors",
@@ -951,13 +1258,28 @@ class HighlightsCog(commands.Cog):
         )
         
         # Statistics
-        highlights_today = len([ts for ts in self.highlighted_messages.values() 
-                               if (datetime.now() - ts).days == 0])
+        now = datetime.now(timezone.utc)
+        highlights_today = len([
+            ts for ts in self.highlighted_messages.values()
+            if (now - _as_utc(ts)).days == 0
+        ])
         
         embed.add_field(
             name="📊 Statistics",
             value=f"Highlights today: {highlights_today}\n"
                   f"Total tracked: {len(self.highlighted_messages)}",
+            inline=False
+        )
+
+        # One-time repair scan status
+        completed_at = (self._load_backfill_state().get('completed_guilds') or {}).get(guild_id_str)
+        embed.add_field(
+            name="🧹 Backfill",
+            value=(
+                f"✅ Completed {completed_at}"
+                if completed_at
+                else "⏳ Not run yet (runs once at startup, or `/manage_highlights backfill`)"
+            ),
             inline=False
         )
         
@@ -966,7 +1288,7 @@ class HighlightsCog(commands.Cog):
             value="• Message author must have **Confirmed Reader** role\n"
                   "• Only reactions from users with **Confirmed Reader** role count\n"
                   f"• Message needs {threshold_value} unique reactor{'s' if threshold_value != 1 else ''}\n"
-                  "• Message must be less than **7 days old**\n"
+                  f"• Message must be less than **{self.MESSAGE_MAX_AGE_DAYS} days old**\n"
                   "• Excluded channels: `announcements`, `rules-info`, `resources`",
             inline=False
         )
