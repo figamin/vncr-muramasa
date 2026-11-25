@@ -23,7 +23,7 @@ from cogs.immersion import ANIME_CLASS_ROLE_DEFINITIONS  # noqa: E402
 # Roles and channels shown in /help, read from the features themselves so they stay in step
 from .consequences import PENALTY_ROLE_ID, REWARD_ROLE_ID, TOP_ROLE_IDS, PENALTY_THRESHOLD_HOURS, REWARD_THRESHOLD_HOURS  # noqa: E402
 from .immersion import LOG_BAN_ROLE_ID  # noqa: E402
-from .mal import MAL_LOG_CHANNEL_ID, DAILY_CAP_HOURS  # noqa: E402
+from .list_sync import LOG_CHANNEL_ID as MAL_LOG_CHANNEL_ID, DAILY_CAP_HOURS  # noqa: E402
 
 
 def _field_chunks(lines, limit=1024):
@@ -310,7 +310,7 @@ class CommandsCog(commands.Cog):
                     embed.add_field(
                         name="📝 Core Logging",
                         value=(
-                            "• `/log_anime`: Log anime watching with episode count\n"
+                            "• `/log_anime`: Log anime watching with episode count (or `complete` for the episodes you haven't logged yet)\n"
                             "• `/log_manual`: Manual activity logging with full customization\n"
                             "• `/log_video`: Log video watching with automatic duration detection\n"
                             "• `/log_vn`: Log visual novel reading with optional character counts\n"
@@ -321,13 +321,15 @@ class CommandsCog(commands.Cog):
                         inline=False
                     )
                     embed.add_field(
-                        name="🔗 MyAnimeList",
+                        name="🔗 MyAnimeList / AniList",
                         value=(
-                            "• `/mal link`: Link your MyAnimeList account\n"
-                            "• `/mal status`: See your link and today's MAL time\n"
-                            "• `/mal unlink`: Stop syncing with MyAnimeList\n"
-                            "Once linked, `/log_anime` also updates your MAL list, and episodes you mark as "
-                            f"watched on MAL are logged in <#{MAL_LOG_CHANNEL_ID}> (up to {DAILY_CAP_HOURS}h a day)."
+                            "• `/mal link` or `/anilist link`: Link your MyAnimeList or AniList account (one of them)\n"
+                            "• `/mal status` or `/anilist status`: See your link and today's synced time\n"
+                            "• `/mal unlink` or `/anilist unlink`: Stop syncing\n"
+                            "Once linked, `/log_anime` also updates your list there, and episodes you mark as "
+                            f"watched there are logged in <#{MAL_LOG_CHANNEL_ID}> (up to {DAILY_CAP_HOURS}h a day). "
+                            "Undoing a synced log removes its episodes there, and removing episodes there "
+                            "undoes the synced log."
                         ),
                         inline=False
                     )
@@ -508,7 +510,7 @@ class CommandsCog(commands.Cog):
                 f"• Monthly leaderboard (top 3 anime time): {top_lines}\n"
                 f"• {REWARD_THRESHOLD_HOURS}h+ logged in a month (reward): {role_text(REWARD_ROLE_ID)}\n"
                 f"• Under {PENALTY_THRESHOLD_HOURS}h logged in a month (punishment): {role_text(PENALTY_ROLE_ID)}\n"
-                f"• Logging ban (can't use /log_anime, MAL updates not counted): {role_text(LOG_BAN_ROLE_ID)}"
+                f"• Logging ban (can't use /log_anime, MAL/AniList updates not counted): {role_text(LOG_BAN_ROLE_ID)}"
                 f"{status}"
             ),
             inline=False,

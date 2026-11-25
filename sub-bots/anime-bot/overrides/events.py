@@ -60,7 +60,9 @@ class EventsCog(ParentEventsCog):
             value=(
                 "• After watching, use `/log_anime` with the name and number of episodes\n"
                 "• Example: `/log_anime name:Frieren episodes:3`\n"
-                "• It is not allowed to log anime you watched more than two weeks in the past\n\n"
+                "• It is not allowed to log anime you watched more than two weeks in the past\n"
+                "• Use MyAnimeList or AniList? Link it with `/mal link` or `/anilist link` and what you "
+                "mark as watched there gets logged automatically\n\n"
                 "Make sure to log the anime you watch! Or face the consequences..."
             ),
             inline=False

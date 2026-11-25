@@ -395,7 +395,7 @@ class UndoLogButton(
             )
             return
 
-        success = await cog.activity_repo.delete_activity(self.activity_id, str(self.user_id))
+        success = await cog._undo_activity(self.activity_id, str(self.user_id))
         if not success:
             await interaction.followup.send(
                 f"❌ Failed to delete activity ID `{self.activity_id}`. It may have already been deleted.",
@@ -2189,7 +2189,7 @@ class ImmersionCog(commands.Cog):
         user_id: str,
         guild_id: Optional[str],
         name: str,
-        episodes: int,
+        episodes: Union[int, str],
         episode_duration: int = 24,
         activity_date: Optional[datetime] = None,
         comment: Optional[str] = None,
@@ -2207,12 +2207,51 @@ class ImmersionCog(commands.Cog):
         only `error` is set. After saving, dispatches "anime_activity_logged" (activity, source).
         `use_official_duration=False` keeps episode_duration as given instead of AniList's.
         `fallback_name` is used as the title when AniList can't resolve `name`.
+        When _anime_total_episodes knows the anime's episode count, `episodes` is capped at it
+        (with a warning in the embed), and episodes="complete" logs the ones not logged yet.
         """
         activity_date = activity_date or datetime.now(timezone.utc)
         anime_context = await self._build_anilist_context(MediaType.ANIME.value, name)
         display_name = anime_context.get("display_name") or name
         if fallback_name and anime_context.get("anilist_id") is None:
             display_name = fallback_name
+
+        # Episode cap and "complete": only when the anime's episode count can be checked.
+        # The cap is for all of the member's logs of this anime together, not per log.
+        total_episodes, total_source, still_airing = await self._anime_total_episodes(anime_context)
+        episode_note: Optional[Tuple[str, str]] = None
+        logged_as_complete = isinstance(episodes, str)
+        already = 0
+        if total_episodes:
+            already = await self._anime_episodes_logged(user_id, display_name, anime_context.get("anilist_id"))
+        all_logged_error = f"❌ You've already logged all {total_episodes} episodes of {display_name}."
+        if logged_as_complete:   # "complete": log the episodes not logged yet
+            if still_airing:
+                return None, None, None, [], None, (
+                    f"❌ {display_name} is still airing, so `complete` can't be used. "
+                    "Enter the number of episodes instead."
+                )
+            if not total_episodes:
+                return None, None, None, [], None, (
+                    f"❌ The number of episodes of {display_name} couldn't be checked, so `complete` can't be used. "
+                    "Pick the anime from the suggestions, or enter the number of episodes instead."
+                )
+            if already >= total_episodes:
+                return None, None, None, [], None, all_logged_error
+            episodes = total_episodes - already
+            episode_note = ("✅ Completed", f"Logged the {episodes} episodes you hadn't logged yet "
+                                            f"({already} of {total_episodes} before).")
+        elif total_episodes and already + episodes > total_episodes:
+            remaining = total_episodes - already
+            if remaining <= 0:
+                return None, None, None, [], None, all_logged_error
+            if already:
+                reason = (f"{display_name} has {total_episodes} episodes on {total_source} and you had "
+                          f"already logged {already}")
+            else:
+                reason = f"{display_name} only has {total_episodes} episodes on {total_source}"
+            episode_note = ("⚠️ Episodes capped", f"{reason}, so this log was reduced from {episodes} to {remaining}.")
+            episodes = remaining
 
         # Determine per-episode duration using AniList data when available
         official_duration = anime_context.get("episode_duration")
@@ -2257,6 +2296,8 @@ class ImmersionCog(commands.Cog):
             activity.set_meta('anilist_id', anime_context.get("anilist_id"))
         if anime_context.get("total_episodes") is not None:
             activity.set_meta('anilist_total_episodes', anime_context.get("total_episodes"))
+        if logged_as_complete:
+            activity.set_meta('logged_as_complete', True)
         for key, value in (extra_meta or {}).items():
             activity.set_meta(key, value)
 
@@ -2287,6 +2328,8 @@ class ImmersionCog(commands.Cog):
         embed.add_field(name="Title", value=display_name, inline=False)
         embed.add_field(name="Episodes", value=str(episodes), inline=True)
         embed.add_field(name="Duration", value=_format_duration_value(activity.duration), inline=True)
+        if episode_note:
+            embed.add_field(name=episode_note[0], value=episode_note[1], inline=False)
 
         if anime_context.get("cover_url"):
             embed.set_thumbnail(url=anime_context["cover_url"])
@@ -3574,6 +3617,36 @@ class ImmersionCog(commands.Cog):
             logger.error(f"Error while running class_roles_sync: {exc}")
             await interaction.followup.send("An error occurred while syncing roles.", ephemeral=True)
 
+    async def _undo_activity(self, activity_id: int, user_id: str) -> bool:
+        """Deletes (undoes) a log, then dispatches "activity_undone" (activity_id, user_id)
+        so sub-bots can react (the anime bot takes the episodes back off MyAnimeList)."""
+        success = await self.activity_repo.delete_activity(activity_id, user_id)
+        if success:
+            try:
+                self.bot.dispatch("activity_undone", int(activity_id), str(user_id))
+            except Exception as exc:
+                logger.warning(f"activity_undone dispatch failed: {exc}")
+        return success
+
+    async def _anime_episodes_logged(self, user_id: str, title: str, anilist_id: Optional[Any]) -> int:
+        """Episodes of one anime the member has logged so far (same AniList entry, or same title)."""
+        import aiosqlite
+        async with aiosqlite.connect(self.db.db_path) as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(CAST(json_extract(meta, '$.episodes') AS INTEGER)), 0) "
+                "FROM immersion_activities WHERE user_id = ? AND media_type = 'anime' AND deleted_at IS NULL "
+                "AND (name = ? OR (? IS NOT NULL AND CAST(json_extract(meta, '$.anilist_id') AS TEXT) = ?))",
+                (user_id, title, anilist_id, str(anilist_id) if anilist_id is not None else None),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return int((row or [0])[0] or 0)
+
+    async def _anime_total_episodes(self, anime_context: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], bool]:
+        """(episode count, where it came from, still airing) used to cap anime logs and for
+        episodes="complete". Unknown here, so the main bot never caps; the anime bot's
+        override checks MyAnimeList."""
+        return None, None, False
+
     def _can_undo_log(self, member: Union[discord.Member, discord.User], owner_id: int) -> bool:
         """Who may undo a log with its Undo Log button: only its owner here.
         The anime bot's override also lets admins undo anyone's logs."""
@@ -3593,7 +3666,7 @@ class ImmersionCog(commands.Cog):
 
             if activity_id:
                 # Undo specific activity
-                success = await self.activity_repo.delete_activity(activity_id, user_id)
+                success = await self._undo_activity(activity_id, user_id)
                 if success:
                     await self.goal_service.refresh_user_goals(user_id)
                     sync_after_response = True
@@ -3619,7 +3692,7 @@ class ImmersionCog(commands.Cog):
                         color=discord.Color.blue()
                     )
                 else:
-                    success = await self.activity_repo.delete_activity(last_activity.id, user_id)
+                    success = await self._undo_activity(last_activity.id, user_id)
                     if success:
                         await self.goal_service.refresh_user_goals(user_id)
                         sync_after_response = True

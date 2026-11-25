@@ -9,7 +9,9 @@ OVERRIDES PROVIDED:
 ✅ _sync_reward_roles() - Uses anime time for role assignments (core override)
 ✅ _sync_roles_and_notify() - Also tells the consequences cog after each log/undo
 ✅ log_undo + Undo Log button - Admins can undo other members' logs
-✅ log_anime - Blocked for members with the logging-ban role (LOG_BAN_ROLE_ID)
+✅ log_anime - Blocked for members with the logging-ban role (LOG_BAN_ROLE_ID);
+   episodes also takes "complete"
+✅ _anime_total_episodes() - Caps each member's logs of an anime at MyAnimeList's episode count (AniList fallback)
 ✅ manage_anime_time - Admins give or remove a member's anime watch time
 ✅ profile - Shows anime-focused immersion profile
 ✅ Helper methods for anime class progress display
@@ -130,41 +132,87 @@ class ImmersionCog(ParentImmersionCog):
     def _is_banned_from_logging(member: Union[discord.Member, discord.User]) -> bool:
         return any(role.id == LOG_BAN_ROLE_ID for role in getattr(member, "roles", []))
 
-    # Same name, options and autocomplete as the parent's /log_anime (keep them in step);
-    # it only adds the ban check before handing over to the parent command.
+    # Same name, options and autocomplete as the parent's /log_anime (keep them in step).
+    # It adds the ban check, and `episodes` also takes "complete" (log the episodes not
+    # logged yet); the episode cap itself is in the parent's _log_anime_core.
     @app_commands.command(name="log_anime", description="Log anime watching")
     @app_commands.describe(
         name="Name of the anime",
-        episodes="Number of episodes watched",
+        episodes="Number of episodes watched, or 'complete' to log the episodes you haven't logged yet",
         episode_duration="Duration per episode in minutes (default: 24)",
         date=DATE_FORMAT_HELP,
         comment="Optional comment or note about this log entry"
     )
     @app_commands.autocomplete(date=ParentImmersionCog._date_autocomplete)
     async def log_anime(self, interaction: discord.Interaction, name: str,
-                        episodes: int, episode_duration: int = 24, date: str = None, comment: str = None):
+                        episodes: str, episode_duration: int = 24, date: str = None, comment: str = None):
         """Log anime watching, unless the member has the logging-ban role."""
         if self._is_banned_from_logging(interaction.user):
             await interaction.response.send_message(LOG_BAN_MESSAGE, ephemeral=True)
             return
+        text = (episodes or "").strip().lower()
+        if text == "complete":
+            episode_value: Union[int, str] = "complete"
+        elif text.isdecimal() and int(text) > 0:
+            episode_value = int(text)
+        else:
+            await interaction.response.send_message(
+                "❌ Episodes must be a number (like `3`) or `complete`.", ephemeral=True
+            )
+            return
         await ParentImmersionCog.log_anime.callback(
-            self, interaction, name, episodes, episode_duration, date, comment
+            self, interaction, name, episode_value, episode_duration, date, comment
         )
-        # If their MyAnimeList sync can't work (their link, or the server's MAL connection,
-        # has expired), tell them right here, only visible to them
-        try:
-            mal = self.bot.get_cog("MalCog")
-            if mal is not None and hasattr(mal, "log_notice"):
-                notice = await mal.log_notice(interaction.guild, interaction.user)
-                if notice:
-                    await interaction.followup.send(notice, ephemeral=True)
-        except Exception as e:
-            logger.warning(f"MAL notice after /log_anime failed: {e}")
+        # If their MyAnimeList/AniList sync can't work (their link, or the server's MAL
+        # connection, has expired), tell them right here, only visible to them
+        for cog_name in ("MalCog", "AniListCog"):
+            try:
+                site = self.bot.get_cog(cog_name)
+                if site is not None and hasattr(site, "log_notice"):
+                    notice = await site.log_notice(interaction.guild, interaction.user)
+                    if notice:
+                        await interaction.followup.send(notice, ephemeral=True)
+            except Exception as e:
+                logger.warning(f"{cog_name} notice after /log_anime failed: {e}")
 
     @log_anime.autocomplete("name")
     async def log_anime_name_autocomplete(self, interaction: discord.Interaction, current: str):
         """AniList title suggestions, same as the parent's /log_anime."""
         return await super().log_anime_name_autocomplete(interaction, current)
+
+    @log_anime.autocomplete("episodes")
+    async def log_anime_episodes_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Suggests "complete" next to whatever number is being typed."""
+        typed = (current or "").strip()
+        choices = []
+        if typed.isdecimal() and int(typed) > 0:
+            choices.append(app_commands.Choice(name=typed, value=typed))
+        if not typed or "complete".startswith(typed.lower()) or typed.isdecimal():
+            choices.append(app_commands.Choice(name="complete (log the episodes you haven't logged yet)", value="complete"))
+        return choices
+
+    async def _anime_total_episodes(self, anime_context: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], bool]:
+        """The anime's episode count for the /log_anime cap and "complete": MyAnimeList's
+        (public data, only needs the bot's MAL Client ID), else AniList's. Neither known =
+        no cap. Also says whether it's still airing ("complete" isn't allowed then)."""
+        status = str(anime_context.get("status") or "").upper()
+        still_airing = status in ("RELEASING", "NOT_YET_RELEASED")
+        mal_id = ((anime_context.get("meta") or {}).get("anilist") or {}).get("mal_id")
+        mal = self.bot.get_cog("MalCog")
+        if mal_id and mal is not None and hasattr(mal, "anime_info"):
+            try:
+                info = await mal.anime_info(int(mal_id))
+            except Exception as e:
+                logger.warning(f"MAL episode count lookup failed for {mal_id}: {e}")
+                info = None
+            if info is not None:
+                total, still_airing = info
+                if total:
+                    return total, "MyAnimeList", still_airing
+        total = anime_context.get("total_episodes")
+        if total:
+            return int(total), "AniList", still_airing
+        return None, None, still_airing
 
     # ---------------- undoing logs: admins can undo anyone's ----------------
 
@@ -224,7 +272,7 @@ class ImmersionCog(ParentImmersionCog):
             success = False
             if failure is None:
                 owner_id = str(activity.user_id)
-                success = await self.activity_repo.delete_activity(activity.id, owner_id)
+                success = await self._undo_activity(activity.id, owner_id)
                 if not success:
                     failure = "Failed to undo the activity."
 
@@ -862,6 +910,7 @@ class ImmersionCog(ParentImmersionCog):
             "manual": "after a manual sync.",
             "admin_time": "after an admin changed your anime watch time.",
             "mal_import": "after your MyAnimeList update.",
+            "anilist_import": "after your AniList update.",
         }
         trigger_phrase = trigger_map.get(source, "after your recent activity.")
 

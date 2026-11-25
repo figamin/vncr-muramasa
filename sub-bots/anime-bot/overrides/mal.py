@@ -1,12 +1,11 @@
 """
 LJTA (Learn Japanese Through Anime) - MyAnimeList link (anime bot only)
 
-Members link their MyAnimeList account with /mal link. Then, in both directions:
-- Discord -> MAL: every /log_anime adds those episodes to that anime on their MAL list.
-- MAL -> Discord: every few minutes, new episodes they mark as watched on MAL are logged
-  as normal anime logs and posted in the MAL log channel, looking the same as /log_anime.
-  At most 5 hours a day come in this way. When a member reaches the cap they're pinged
-  once, and further MAL updates that day are dropped (not logged or posted, ever).
+Members link their MyAnimeList account with /mal link. The syncing itself (both ways, the
+daily cap, undo both ways) is shared with AniList and lives in list_sync.py; this file is
+the MyAnimeList part: logging in, reading and changing a member's MAL list, /manage_mal.
+/log_anime can't log more episodes of an anime than MAL says it has (the anime
+ImmersionCog's _anime_total_episodes uses anime_info here).
 
 Setup: the MAL app's Client ID is built in (DEFAULT_CLIENT_ID below; it's public anyway).
 Its Client Secret is NOT in the code: an admin enters it once per server with
@@ -24,7 +23,7 @@ import asyncio
 import logging
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -33,7 +32,9 @@ import aiohttp
 import aiosqlite
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
+
+from .list_sync import DAILY_CAP_HOURS, FALLBACK_EPISODE_MINUTES, LOG_CHANNEL_ID, UNDO_DAYS, ListSync, now_utc
 
 logger = logging.getLogger(__name__)
 
@@ -41,18 +42,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # SETTINGS - edit IDs, limits and messages here.
 # ---------------------------------------------------------------------------
-MAL_LOG_CHANNEL_ID = 1415741464545329272   # MAL -> Discord logs and cap notices go here
-DAILY_CAP_HOURS = 5                       # max anime time per member per day (UTC) from MAL
-POLL_MINUTES = 10                         # how often linked lists are checked
-FALLBACK_EPISODE_MINUTES = 24             # when MAL doesn't know an episode's length
-
-# Posted once when a member reaches the cap. {user} pings them; {hours} is the cap.
-CAP_MESSAGE = (
-    "{user} you've reached your daily MAL cap limit of {hours} hours. "
-    "No more MyAnimeList updates will be logged for you today."
-)
-# Shown above each MAL log so the channel shows whose log it is (no ping).
-IMPORT_HEADER = "{user} logged on MyAnimeList"
+# The log channel, daily cap, and the log/cap/removal messages are shared with AniList:
+# edit them in list_sync.py. (Same names here for older code.)
+MAL_LOG_CHANNEL_ID = LOG_CHANNEL_ID
+MAL_UNDO_DAYS = UNDO_DAYS
 
 # Shown (only to them) when someone logs anime while their MAL sync can't work.
 EXPIRED_MEMBER_NOTICE = (
@@ -76,10 +69,6 @@ API_URL = "https://api.myanimelist.net/v2"
 ANILIST_URL = "https://graphql.anilist.co"
 LIST_FIELDS = "list_status,num_episodes,average_episode_duration"
 LINK_TIMEOUT_MINUTES = 15
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class PasteLinkModal(discord.ui.Modal, title="Finish linking MyAnimeList"):
@@ -113,26 +102,27 @@ class LinkView(discord.ui.View):
         await interaction.response.send_modal(PasteLinkModal(self.cog))
 
 
-class MalCog(commands.Cog):
-    """Two-way MyAnimeList sync for the anime bot"""
+class MalCog(ListSync, commands.Cog):
+    """Two-way MyAnimeList sync for the anime bot (the shared part is ListSync)"""
+
+    SERVICE, SHORT, PREFIX, SOURCE = "MyAnimeList", "MAL", "mal", "myanimelist"
+    WATCHING, COMPLETED = "watching", "completed"
 
     mal = app_commands.Group(name="mal", description="Link your MyAnimeList account", guild_only=True)
 
     def __init__(self, bot):
-        self.bot = bot
         # The main data/ folder (next to vnbot.db), which Docker keeps between rebuilds.
         # A separate file, so MAL logins stay out of the shared database and its backups.
         data_dir = Path(__file__).resolve().parents[3] / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = str(data_dir / "anime_mal.db")
+        ListSync.__init__(self, bot, str(data_dir / "anime_mal.db"))
         self.pending: Dict[str, Tuple[str, str, datetime]] = {}   # user_id -> (verifier, state, started)
-        self.lock = asyncio.Lock()   # one MAL sync at a time, so pushes and imports never cross
         self.session: Optional[aiohttp.ClientSession] = None
         self.stored_secret: str = ""          # set with /manage_mal (loaded in init_db)
         self.app_broken = False               # MAL stopped accepting the secret
         self.enabled_guilds: set = set()      # servers where an admin connected MAL
-        self.push_tasks: Dict[str, asyncio.Task] = {}   # user_id -> their latest Discord -> MAL push
         self.last_secret_check: Optional[datetime] = None
+        self.anime_cache: Dict[int, Tuple[datetime, Tuple[int, bool]]] = {}   # mal_id -> (fetched, info)
 
     # ---------------- setup ----------------
 
@@ -165,19 +155,6 @@ class MalCog(commands.Cog):
                     linked_at TEXT,
                     broken INTEGER NOT NULL DEFAULT 0
                 );
-                CREATE TABLE IF NOT EXISTS mal_snapshot (
-                    user_id TEXT NOT NULL,
-                    anime_id INTEGER NOT NULL,
-                    episodes INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, anime_id)
-                );
-                CREATE TABLE IF NOT EXISTS mal_daily (
-                    user_id TEXT NOT NULL,
-                    day TEXT NOT NULL,
-                    seconds INTEGER NOT NULL DEFAULT 0,
-                    capped INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, day)
-                );
                 CREATE TABLE IF NOT EXISTS mal_anilist (
                     mal_id INTEGER PRIMARY KEY,
                     anilist_id INTEGER
@@ -192,6 +169,7 @@ class MalCog(commands.Cog):
                     enabled_at TEXT
                 );
             """)
+            await self.create_sync_tables(db)
             await db.commit()
             async with db.execute("SELECT key, value FROM mal_app") as cur:
                 app = dict(await cur.fetchall())
@@ -346,41 +324,14 @@ class MalCog(commands.Cog):
             )
             await db.commit()
 
-    async def get_snapshot(self, user_id: str) -> Dict[int, int]:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT anime_id, episodes FROM mal_snapshot WHERE user_id = ?", (user_id,)) as cur:
-                return {int(a): int(e) for a, e in await cur.fetchall()}
-
-    async def set_snapshot(self, user_id: str, anime_id: int, episodes: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO mal_snapshot (user_id, anime_id, episodes) VALUES (?, ?, ?) "
-                "ON CONFLICT(user_id, anime_id) DO UPDATE SET episodes = excluded.episodes",
-                (user_id, anime_id, episodes),
-            )
-            await db.commit()
-
-    async def get_daily(self, user_id: str, day: str) -> Tuple[int, bool]:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT seconds, capped FROM mal_daily WHERE user_id = ? AND day = ?", (user_id, day)) as cur:
-                row = await cur.fetchone()
-                return (int(row[0]), bool(row[1])) if row else (0, False)
-
-    async def set_daily(self, user_id: str, day: str, seconds: int, capped: bool):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO mal_daily (user_id, day, seconds, capped) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(user_id, day) DO UPDATE SET seconds = excluded.seconds, capped = excluded.capped",
-                (user_id, day, seconds, int(capped)),
-            )
-            await db.commit()
-
     # ---------------- HTTP ----------------
 
-    async def _http(self, method: str, url: str, *, headers=None, params=None, data=None) -> Tuple[int, Dict[str, Any]]:
+    async def _http(self, method: str, url: str, *, headers=None, params=None, data=None,
+                    timeout: Optional[float] = None) -> Tuple[int, Dict[str, Any]]:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        async with self.session.request(method, url, headers=headers, params=params, data=data) as resp:
+        extra = {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout else {}
+        async with self.session.request(method, url, headers=headers, params=params, data=data, **extra) as resp:
             try:
                 body = await resp.json(content_type=None)
             except Exception:
@@ -448,6 +399,28 @@ class MalCog(commands.Cog):
             params = None   # the "next" link already carries them
         return entries
 
+    async def anime_info(self, mal_id: int) -> Optional[Tuple[int, bool]]:
+        """(number of episodes, still airing) from MyAnimeList's public data; needs only the
+        Client ID, no member login. 0 episodes = MAL doesn't know yet. None if MAL can't be
+        reached (then MAL doesn't cap the log). Cached for 12 hours."""
+        cached = self.anime_cache.get(int(mal_id))
+        if cached and now_utc() - cached[0] < timedelta(hours=12):
+            return cached[1]
+        try:
+            status, body = await self._http(
+                "GET", f"{API_URL}/anime/{int(mal_id)}", headers={"X-MAL-CLIENT-ID": self.client_id},
+                params={"fields": "num_episodes,status"}, timeout=6,
+            )
+        except Exception as e:
+            logger.warning(f"[MAL] Couldn't read the episode count of MAL anime {mal_id}: {e!r}")
+            return None
+        if status != 200:
+            logger.warning(f"[MAL] Couldn't read the episode count of MAL anime {mal_id}: {status}")
+            return None
+        info = (int(body.get("num_episodes") or 0), body.get("status") in ("currently_airing", "not_yet_aired"))
+        self.anime_cache[int(mal_id)] = (now_utc(), info)
+        return info
+
     async def anilist_name(self, mal_id: int, title: str) -> str:
         """What to give the anime log builder: the AniList page for this MAL anime (so the log
         shows the same title, cover and button as /log_anime), or MAL's title if not on AniList."""
@@ -491,6 +464,10 @@ class MalCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        other = await self.other_site_message(str(interaction.user.id))
+        if other:
+            await interaction.response.send_message(other, ephemeral=True)
+            return
         auth_url = self.start_link(str(interaction.user.id))
         text = (
             "Link your MyAnimeList account\n"
@@ -524,6 +501,9 @@ class MalCog(commands.Cog):
     async def complete_link(self, user_id: str, pasted: str) -> Tuple[bool, str]:
         """Finish linking from the address the member pasted. Returns (linked?, message for
         the member). Only the member sees the message; it names their MAL account."""
+        other = await self.other_site_message(user_id)
+        if other:
+            return False, other
         pending = self.pending.get(user_id)
         if not pending or now_utc() - pending[2] > timedelta(minutes=LINK_TIMEOUT_MINUTES):
             return False, "That link expired. Please start again with `/mal link`."
@@ -556,7 +536,7 @@ class MalCog(commands.Cog):
                     row = await cur.fetchone()
                 if row and row[0] != user_id:
                     return False, "That MyAnimeList account is already linked to another Discord account."
-                await db.execute("DELETE FROM mal_snapshot WHERE user_id = ?", (user_id,))
+                await self.forget_user(db, user_id)   # a new link starts fresh
                 await db.execute(
                     "INSERT OR REPLACE INTO mal_links (user_id, mal_user_id, mal_name, access_token, refresh_token, "
                     "expires_at, linked_at, broken) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
@@ -566,7 +546,12 @@ class MalCog(commands.Cog):
                 await db.commit()
             link = await self.get_link(user_id)
             # Starting point: what's already on the list is NOT logged, only what changes from now on
-            entries = await self.fetch_list(link, all_pages=True) or []
+            entries = await self.fetch_list(link, all_pages=True)
+            if entries is None:   # without a starting point their whole list would look new
+                async with aiosqlite.connect(self.db_path) as db:
+                    await db.execute("DELETE FROM mal_links WHERE user_id = ?", (user_id,))
+                    await db.commit()
+                return False, "Couldn't read your MyAnimeList list. Please try `/mal link` again later."
             for entry in entries:
                 await self.set_snapshot(user_id, entry["node"]["id"], int(entry["list_status"].get("num_episodes_watched") or 0))
 
@@ -588,7 +573,7 @@ class MalCog(commands.Cog):
         async with self.lock:
             async with aiosqlite.connect(self.db_path) as db:
                 cur = await db.execute("DELETE FROM mal_links WHERE user_id = ?", (user_id,))
-                await db.execute("DELETE FROM mal_snapshot WHERE user_id = ?", (user_id,))
+                await self.forget_user(db, user_id)
                 await db.commit()
                 removed = cur.rowcount
         self.pending.pop(user_id, None)
@@ -617,61 +602,17 @@ class MalCog(commands.Cog):
         )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    # ---------------- Discord -> MAL ----------------
+    # ---------------- what list_sync.ListSync needs from MAL ----------------
 
-    @commands.Cog.listener()
-    async def on_anime_activity_logged(self, activity, source: str):
-        """After /log_anime: add the episodes to the member's MAL list."""
-        if source != "command":
-            return
-        # Remembered so /log_anime's expiry notice can wait for this update to finish
-        self.push_tasks[str(activity.user_id)] = asyncio.current_task()
-        if not self.guild_ready(getattr(activity, "guild_id", None)):
-            return
-        link = await self.get_link(str(activity.user_id))
-        if not link or link["broken"]:
-            return
-        mal_id = ((activity.meta or {}).get("anilist") or {}).get("mal_id")
-        episodes = int((activity.meta or {}).get("episodes") or 0)
-        if not mal_id or episodes <= 0:
-            return
-        await self.push_to_mal(link, int(mal_id), episodes)
+    def sync_ready(self, guild_id) -> bool:
+        return self.guild_ready(guild_id)
 
-    async def push_to_mal(self, link: Dict[str, Any], mal_id: int, episodes: int):
-        """Add `episodes` to this anime on the member's MAL list (Watching, or Completed at the
-        last episode). Shows already Completed on MAL are left alone."""
-        try:
-            async with self.lock:
-                status, details = await self._api(link, "GET", f"/anime/{mal_id}", params={"fields": "num_episodes,my_list_status"})
-                if status != 200:
-                    logger.warning(f"[MAL] Couldn't read MAL anime {mal_id} for {link['user_id']}: {status}")
-                    return
-                current = details.get("my_list_status") or {}
-                if current.get("status") == "completed":
-                    return   # already finished on MAL: leave rewatches to the member
-                total = int(details.get("num_episodes") or 0)   # 0 = unknown (still airing)
-                watched = int(current.get("num_episodes_watched") or 0) + episodes
-                new_status = "watching"
-                if total and watched >= total:
-                    watched, new_status = total, "completed"
-                status, _ = await self._api(
-                    link, "PATCH", f"/anime/{mal_id}/my_list_status",
-                    data={"num_watched_episodes": str(watched), "status": new_status},
-                )
-                if status != 200:
-                    logger.warning(f"[MAL] Couldn't update MAL anime {mal_id} for {link['user_id']}: {status}")
-                    return
-                # So the MAL -> Discord check doesn't log these episodes a second time
-                await self.set_snapshot(link["user_id"], int(mal_id), watched)
-        except Exception as e:
-            logger.exception(f"[MAL] Sync to MAL failed for {link['user_id']}: {e}")
+    def app_ok(self) -> bool:
+        return bool(self.client_secret) and not self.app_broken
 
-    # ---------------- MAL -> Discord ----------------
-
-    @tasks.loop(minutes=POLL_MINUTES)
-    async def poll(self):
+    async def poll_ready(self) -> bool:
         if not self.client_secret:
-            return
+            return False
         # Every few hours, check MAL still accepts the secret, so an expired connection is
         # noticed (and members told) even before a login needs refreshing
         if self.last_secret_check is None or now_utc() - self.last_secret_check > timedelta(hours=SECRET_CHECK_HOURS):
@@ -679,94 +620,58 @@ class MalCog(commands.Cog):
             if ok is not None:
                 self.last_secret_check = now_utc()
                 await self.set_app_broken(not ok)
-        channel = self.bot.get_channel(MAL_LOG_CHANNEL_ID)
-        if channel is None:
-            logger.warning(f"[MAL] MAL log channel {MAL_LOG_CHANNEL_ID} not found; MAL -> Discord paused")
-            return
-        if not self.guild_ready(channel.guild.id):
-            return   # MAL not connected (or expired) in the server that has the MAL log channel
-        for link in await self.all_links():
-            try:
-                await self.import_from_mal(link, channel)
-            except Exception as e:
-                logger.exception(f"[MAL] Import failed for {link['user_id']}: {e}")
+        return True
 
-    @poll.before_loop
-    async def before_poll(self):
-        await self.bot.wait_until_ready()
+    def anime_id_of(self, meta: Dict[str, Any]) -> Optional[int]:
+        return (meta.get("anilist") or {}).get("mal_id")
 
-    async def import_from_mal(self, link: Dict[str, Any], channel: discord.TextChannel):
-        """Log new episodes the member marked on MAL, up to the daily cap."""
-        guild = channel.guild
-        member = guild.get_member(int(link["user_id"]))
-        immersion = self.bot.get_cog("ImmersionCog")
-        if immersion is None:
-            return
-        imported = False
-        async with self.lock:
-            entries = await self.fetch_list(link, all_pages=False)
-            if entries is None:
-                return
-            snapshot = await self.get_snapshot(link["user_id"])
-            day = now_utc().date().isoformat()
-            used, capped = await self.get_daily(link["user_id"], day)
-            banned = member is not None and hasattr(immersion, "_is_banned_from_logging") \
-                and immersion._is_banned_from_logging(member)
+    async def fetch_recent(self, link: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        entries = await self.fetch_list(link, all_pages=False)
+        if entries is None:
+            return None
+        recent = []
+        for entry in entries:
+            node, list_status = entry["node"], entry.get("list_status") or {}
+            seconds_each = int(node.get("average_episode_duration") or 0) or FALLBACK_EPISODE_MINUTES * 60
+            recent.append({
+                "id": int(node["id"]), "title": node.get("title"),
+                "watched": int(list_status.get("num_episodes_watched") or 0),
+                "status": list_status.get("status"), "score": list_status.get("score") or 0,
+                "rewatching": bool(list_status.get("is_rewatching")),
+                "minutes": max(1, round(seconds_each / 60)), "list_id": None,
+            })
+        return recent
 
-            for entry in reversed(entries):   # oldest change first, so the cap applies in order
-                node, list_status = entry["node"], entry.get("list_status") or {}
-                anime_id = int(node["id"])
-                watched = int(list_status.get("num_episodes_watched") or 0)
-                before = snapshot.get(anime_id, 0)   # not seen before = added to the list since linking
-                if watched == before:
-                    continue
-                # Recorded first: whatever happens next, these episodes are never logged twice
-                await self.set_snapshot(link["user_id"], anime_id, watched)
-                new_episodes = watched - before
-                if new_episodes <= 0 or member is None or member.bot or banned or capped:
-                    continue
+    async def get_entry(self, link: Dict[str, Any], anime_id: int) -> Tuple[bool, Optional[Dict[str, Any]], int]:
+        status, details = await self._api(link, "GET", f"/anime/{anime_id}", params={"fields": "num_episodes,my_list_status"})
+        if status != 200:
+            logger.warning(f"[MAL] Couldn't read MAL anime {anime_id} for {link['user_id']}: {status}")
+            return False, None, 0
+        mine = details.get("my_list_status")
+        entry = None
+        if mine:
+            entry = {"id": int(anime_id), "watched": int(mine.get("num_episodes_watched") or 0),
+                     "status": mine.get("status"), "score": mine.get("score") or 0,
+                     "rewatching": bool(mine.get("is_rewatching")), "list_id": None}
+        return True, entry, int(details.get("num_episodes") or 0)   # 0 = unknown (still airing)
 
-                seconds_each = int(node.get("average_episode_duration") or 0) or FALLBACK_EPISODE_MINUTES * 60
-                minutes_each = max(1, round(seconds_each / 60))
-                room = DAILY_CAP_HOURS * 3600 - used
-                fits = min(new_episodes, room // (minutes_each * 60))
-                if fits > 0:
-                    title = node.get("title") or f"MAL anime {anime_id}"
-                    name = await self.anilist_name(anime_id, title)
-                    activity_id, embed, view, goals, progress_file, error = await immersion._log_anime_core(
-                        link["user_id"], str(guild.id), name, fits, minutes_each, now_utc(), None,
-                        extra_meta={"source": "myanimelist", "mal_anime_id": anime_id},
-                        use_official_duration=False, source="myanimelist", fallback_name=title,
-                    )
-                    if error:
-                        logger.info(f"[MAL] Skipped {anime_id} for {link['user_id']}: {error}")
-                        continue
-                    used += fits * minutes_each * 60
-                    imported = True
-                    await self.set_daily(link["user_id"], day, used, False)
-                    kwargs = {"embed": embed, "view": view}
-                    if progress_file:
-                        kwargs["file"] = progress_file
-                    await channel.send(IMPORT_HEADER.format(user=member.mention),
-                                       allowed_mentions=discord.AllowedMentions.none(), **kwargs)
-                    if goals:
-                        await channel.send(embed=immersion._build_goal_completion_embed(goals),
-                                           allowed_mentions=discord.AllowedMentions.none())
-                if fits < new_episodes or used >= DAILY_CAP_HOURS * 3600:
-                    capped = True
-                    await self.set_daily(link["user_id"], day, used, True)
-                    await channel.send(
-                        CAP_MESSAGE.format(user=member.mention, hours=DAILY_CAP_HOURS),
-                        allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[member]),
-                    )
+    async def save_entry(self, link: Dict[str, Any], anime_id: int, watched: int, status: Optional[str]) -> bool:
+        data = {"num_watched_episodes": str(watched)}
+        if status:
+            data["status"] = status
+        code, _ = await self._api(link, "PATCH", f"/anime/{anime_id}/my_list_status", data=data)
+        return code == 200
 
-        if imported and member is not None:
-            # Class roles, and the penalty/reward checks, follow the new total
-            try:
-                self.bot.dispatch("anime_log_changed", guild, member)
-                await immersion._sync_roles_for_member(member, channel, source="mal_import")
-            except Exception as e:
-                logger.warning(f"[MAL] Role sync after import failed for {member}: {e}")
+    async def delete_entry(self, link: Dict[str, Any], anime_id: int, entry: Dict[str, Any]) -> bool:
+        code, _ = await self._api(link, "DELETE", f"/anime/{anime_id}/my_list_status")
+        return code in (200, 404)
+
+    async def import_name(self, anime_id: int, title: str) -> str:
+        return await self.anilist_name(anime_id, title)
+
+    # Older names (mal-test.py uses them)
+    push_to_mal = ListSync.push_to_list
+    import_from_mal = ListSync.import_from_list
 
 
 async def setup(bot):

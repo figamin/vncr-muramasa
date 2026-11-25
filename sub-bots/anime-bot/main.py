@@ -93,6 +93,7 @@ async def load_extensions():
         'cogs.verification',  # Level quizzes (N5-Insane) that grant roles
         'cogs.consequences',  # Monthly anime penalty/reward roles (anime-bot only: overrides/consequences.py)
         'cogs.mal',  # MyAnimeList link, two-way sync (anime-bot only: overrides/mal.py)
+        'cogs.anilist',  # AniList link, two-way sync (anime-bot only: overrides/anilist.py)
         'cogs.immersion',  # Core time tracking - works for anime too
         'cogs.highlights'
     ]

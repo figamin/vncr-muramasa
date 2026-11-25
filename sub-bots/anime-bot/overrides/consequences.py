@@ -48,7 +48,8 @@ LATE_JOIN_DAY = 15            # joined after this day of a month -> not judged t
 PENALTY_MESSAGE = (
     "{role} Oh no! It looks you haven't been logging any anime and as punishment have been locked in "
     "{channel} ! You must log some anime using the /log_anime command to regain access to the "
-    "rest of the server!"
+    "rest of the server! You can also link your MyAnimeList or AniList account with /mal link or "
+    "/anilist link, and the anime you mark as watched there will be logged for you."
 )
 PENALTY_IMAGE = Path(__file__).parent.parent / "assets" / "consequences" / "psych-ward.jpg"
 
