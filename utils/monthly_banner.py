@@ -338,6 +338,9 @@ class MonthlyBannerGenerator:
         dialogue_pct: Optional[float] = None,
         release_year: Optional[str] = None,
         top_tags: Optional[list[str]] = None,
+        egs_median: Optional[int] = None,
+        bangumi_score: Optional[float] = None,
+        consensus_score: Optional[float] = None,
     ) -> io.BytesIO:
         S = self.SCALE
         img = Image.new("RGB", (self.BANNER_WIDTH, self.BANNER_HEIGHT), self.BG)
@@ -415,7 +418,13 @@ class MonthlyBannerGenerator:
         font_attr = _load_japanese_font(11 * S)
         eb_ascent, eb_descent = font_eyebrow.getmetrics()
         eyebrow_baseline = bar_center_y + (eb_ascent - eb_descent) // 2
-        attr_text = "Data: VNDB · jiten.moe"
+        sources = ["VNDB"]
+        if egs_median is not None:
+            sources.append(f"EGS ({egs_median})")
+        if bangumi_score is not None:
+            sources.append(f"BGM ({bangumi_score:.1f})")
+        sources.append("jiten.moe")
+        attr_text = "Data: " + " · ".join(sources)
         draw.text((self.TEXT_RIGHT, eyebrow_baseline),
                   attr_text, fill=self.INK_TERTIARY, font=font_attr, anchor="rs")
 
@@ -495,8 +504,13 @@ class MonthlyBannerGenerator:
                 ("DIFFICULTY",
                  f"{difficulty:.2f} / 5" if difficulty and difficulty > 0 else "—"),
             ]
+            score_label = "VNDB SCORE"
+            score_val = self._format_vndb_score(vndb_rating, vndb_votecount)
+            if consensus_score is not None and (egs_median is not None or bangumi_score is not None):
+                score_label = "CONSENSUS · VNDB"
+                score_val = f"{consensus_score * 10:.0f}  (VNDB {vndb_rating:.0f})" if vndb_rating else f"{consensus_score * 10:.0f}"
             right_rows = [
-                ("VNDB SCORE", self._format_vndb_score(vndb_rating, vndb_votecount)),
+                (score_label, score_val),
                 ("UNIQUE KANJI", f"{unique_kanji:,}" if unique_kanji else "—"),
                 ("DIALOGUE",
                  f"{dialogue_pct:.0f}%" if dialogue_pct and dialogue_pct > 0 else "—"),

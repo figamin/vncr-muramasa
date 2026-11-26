@@ -37,8 +37,14 @@ from utils.immersion_media import (
 )
 from utils.class_progress_bar import render_class_progress_bar
 from utils.profile_card import ProfileCardGenerator
-from utils.helpers import extract_vndb_id
+from utils.helpers import (
+    extract_vndb_id,
+    egs_game_url,
+    bangumi_subject_url,
+    jiten_deck_url,
+)
 from utils.jiten_client import JitenClient
+from utils.pg_db import get_pg_db
 
 logger = logging.getLogger(__name__)
 
@@ -614,9 +620,18 @@ class ImmersionCog(commands.Cog):
         return fallback
     
     async def _fetch_vn_details(self, vn_id: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Fetch VN details with database caching."""
+        """Fetch VN details from PostgreSQL multi-DB first, falling back to cache + HTTP."""
         if not vn_id:
             return None
+
+        pg = get_pg_db()
+        if pg.is_configured:
+            try:
+                pg_data = await pg.get_vn_by_id(vn_id)
+                if pg_data:
+                    return pg_data
+            except Exception as exc:
+                logger.warning("Failed to load VNDB multi-DB data for %s: %s", vn_id, exc)
 
         try:
             cached = await self.db.get_cached_vndb_data(vn_id)
@@ -679,7 +694,7 @@ class ImmersionCog(commands.Cog):
         return None
 
     async def _build_vn_context(self, raw_value: str) -> Dict[str, Any]:
-        """Resolve VNDB metadata for a log entry."""
+        """Resolve VNDB/EGS/Bangumi/Jiten metadata for a log entry."""
         sanitized_input = (raw_value or "").strip()
 
         context: Dict[str, Any] = {
@@ -690,6 +705,13 @@ class ImmersionCog(commands.Cog):
             "cover_url": None,
             "cover_is_nsfw": False,
             "jiten_deck_id": None,
+            "jiten": None,
+            "egs_id": None,
+            "egs_url": None,
+            "bangumi_id": None,
+            "bangumi_url": None,
+            "consensus_score": None,
+            "external_ratings": None,
             "rating": None,
             "length": None,
             "released": None,
@@ -741,7 +763,16 @@ class ImmersionCog(commands.Cog):
                             logger.info(f"Recovered VN from autocomplete display format (legacy): {title_part} -> {vn_id}")
                     except Exception as e:
                         logger.warning(f"Failed to recover VN from display format: {e}")
-            
+
+            # Try resolving EGS / Bangumi / VNDB URL or ID via multi-DB
+            if not vn_id:
+                pg = get_pg_db()
+                if pg.is_configured:
+                    try:
+                        vn_id = await pg.resolve_vndb_id(sanitized_input)
+                    except Exception as exc:
+                        logger.debug("Multi-DB resolve_vndb_id failed for %s: %s", sanitized_input, exc)
+
             # If still no vn_id, try extracting VNDB ID from input
             if not vn_id:
                 extracted = extract_vndb_id(sanitized_input)
@@ -763,7 +794,11 @@ class ImmersionCog(commands.Cog):
                 image_info = vn_data.get("image") or {}
                 image_url = image_info.get("url")
                 sexual_level = extract_sexual_level(image_info)
-                cover_is_explicit = is_image_explicit(image_info)
+                cover_is_explicit = is_image_explicit(image_info) or bool(vn_data.get("cover_blacklisted"))
+
+                ext = vn_data.get("external_ratings") or {}
+                egs_id = ext.get("egs_id")
+                bangumi_id = ext.get("bangumi_id")
 
                 context.update({
                     "vndb_id": vn_id,
@@ -772,26 +807,47 @@ class ImmersionCog(commands.Cog):
                     "length": vn_data.get("length"),
                     "released": vn_data.get("released"),
                     "titles": titles,
+                    "egs_id": egs_id,
+                    "egs_url": ext.get("egs_url") or (egs_game_url(egs_id) if egs_id else None),
+                    "bangumi_id": bangumi_id,
+                    "bangumi_url": ext.get("bangumi_url") or (bangumi_subject_url(bangumi_id) if bangumi_id else None),
+                    "consensus_score": ext.get("consensus_score"),
+                    "external_ratings": ext or None,
                 })
 
                 if image_url:
                     context["cover_url"] = image_url  # VNDB cover: the real artwork
                     context["cover_is_nsfw"] = cover_is_explicit
 
-                # jiten is used for the deck id and only as a cover *fallback*.
-                # For decks it has no artwork for, jiten serves an auto-generated
-                # placeholder (a gradient with the title), so it must never
-                # override the VNDB cover.
-                try:
-                    async with JitenClient() as jiten:
-                        jinfo = await jiten.get_by_vndb_id(vn_id)
-                    if jinfo:
-                        context["jiten_deck_id"] = jinfo.deck_id
-                        if jinfo.cover_url and not context["cover_url"]:
-                            context["cover_url"] = jinfo.cover_url
-                            context["cover_is_nsfw"] = False
-                except Exception as e:
-                    logger.warning("jiten lookup failed for %s: %s", vn_id, e)
+                jiten_dict = vn_data.get("jiten")
+                if isinstance(jiten_dict, dict) and jiten_dict.get("deck_id") is not None:
+                    context["jiten_deck_id"] = jiten_dict["deck_id"]
+                    context["jiten"] = jiten_dict
+                    if jiten_dict.get("cover_url") and not context["cover_url"]:
+                        context["cover_url"] = jiten_dict["cover_url"]
+                        context["cover_is_nsfw"] = False
+                else:
+                    # jiten is used for the deck id and only as a cover *fallback*.
+                    # For decks it has no artwork for, jiten serves an auto-generated
+                    # placeholder (a gradient with the title), so it must never
+                    # override the VNDB cover.
+                    try:
+                        async with JitenClient() as jiten:
+                            jinfo = await jiten.get_by_vndb_id(vn_id)
+                        if jinfo:
+                            context["jiten_deck_id"] = jinfo.deck_id
+                            context["jiten"] = {
+                                "deck_id": jinfo.deck_id,
+                                "character_count": jinfo.character_count,
+                                "difficulty_raw": jinfo.difficulty_raw,
+                                "unique_kanji_count": jinfo.unique_kanji_count,
+                                "dialogue_percentage": jinfo.dialogue_percentage,
+                            }
+                            if jinfo.cover_url and not context["cover_url"]:
+                                context["cover_url"] = jinfo.cover_url
+                                context["cover_is_nsfw"] = False
+                    except Exception as e:
+                        logger.warning("jiten lookup failed for %s: %s", vn_id, e)
 
                 vn_meta = {
                     "id": vn_id,
@@ -803,6 +859,10 @@ class ImmersionCog(commands.Cog):
                     "image_url": image_url,
                     "image_sexual": sexual_level,
                     "preferred_field": preferred_key,
+                    "jiten_deck_id": context.get("jiten_deck_id"),
+                    "egs_id": egs_id,
+                    "bangumi_id": bangumi_id,
+                    "external_ratings": ext or None,
                 }
 
                 context["meta"]["vn"] = vn_meta
@@ -1603,11 +1663,25 @@ class ImmersionCog(commands.Cog):
                 url=vn_context["vndb_url"],
             ))
 
+        if vn_context.get("egs_url"):
+            view.add_item(discord.ui.Button(
+                label="EroGamescape",
+                style=discord.ButtonStyle.link,
+                url=vn_context["egs_url"],
+            ))
+
+        if vn_context.get("bangumi_url"):
+            view.add_item(discord.ui.Button(
+                label="Bangumi",
+                style=discord.ButtonStyle.link,
+                url=vn_context["bangumi_url"],
+            ))
+
         if vn_context.get("jiten_deck_id") is not None:
             view.add_item(discord.ui.Button(
                 label="jiten.moe",
                 style=discord.ButtonStyle.link,
-                url=f"https://jiten.moe/decks/media/{vn_context['jiten_deck_id']}/detail",
+                url=jiten_deck_url(vn_context["jiten_deck_id"]),
             ))
 
         return activity_id, embed, view, completed_goals, progress_file
@@ -2830,8 +2904,29 @@ class ImmersionCog(commands.Cog):
                         "rating": vn_meta.get("rating"),
                         "length": vn_meta.get("length"),
                         "released": vn_meta.get("released"),
-                        "titles": vn_meta.get("titles", {})
+                        "titles": vn_meta.get("titles", {}),
+                        "jiten_deck_id": vn_meta.get("jiten_deck_id"),
+                        "external_ratings": vn_meta.get("external_ratings"),
+                        "jiten": None,
                     }
+                    # Enrich legacy or partial logs from live multi-DB if available
+                    pg = get_pg_db()
+                    if pg.is_configured and (
+                        not api_metadata.get("external_ratings") or api_metadata.get("jiten") is None
+                    ):
+                        try:
+                            live_vn = await pg.get_vn_by_id(vn_meta["id"], include_tags=False)
+                            if live_vn:
+                                api_metadata["external_ratings"] = (
+                                    api_metadata.get("external_ratings") or live_vn.get("external_ratings")
+                                )
+                                api_metadata["jiten"] = live_vn.get("jiten")
+                                if live_vn.get("jiten") and not api_metadata.get("jiten_deck_id"):
+                                    api_metadata["jiten_deck_id"] = live_vn["jiten"].get("deck_id")
+                                if live_vn.get("cover_blacklisted"):
+                                    api_metadata["cover_is_nsfw"] = True
+                        except Exception as exc:
+                            logger.debug("Could not enrich VN log details from multi-DB: %s", exc)
                     logger.info(f"Using stored VN metadata for {activity.name}: {api_metadata}")
                 else:
                     # Fall back to fetching VN metadata
@@ -2849,7 +2944,10 @@ class ImmersionCog(commands.Cog):
                                 "rating": vn_context.get("rating"),
                                 "length": vn_context.get("length"),
                                 "released": vn_context.get("released"),
-                                "titles": vn_context.get("titles", {})
+                                "titles": vn_context.get("titles", {}),
+                                "jiten_deck_id": vn_context.get("jiten_deck_id"),
+                                "external_ratings": vn_context.get("external_ratings"),
+                                "jiten": vn_context.get("jiten"),
                             }
                             logger.info(f"Created VN api_metadata: {api_metadata}")
                         else:
@@ -3041,25 +3139,61 @@ class ImmersionCog(commands.Cog):
                 if api_metadata["type"] == "vndb":
                     api_fields = []
                     if api_metadata.get("rating"):
-                        api_fields.append(f"Rating: {api_metadata['rating']:.1f}/10")
+                        raw_rating = float(api_metadata["rating"])
+                        rating_10 = raw_rating / 10.0 if raw_rating > 10 else raw_rating
+                        api_fields.append(f"VNDB Rating: {rating_10:.2f}/10")
+
+                    ext = api_metadata.get("external_ratings") or {}
+                    if ext.get("egs_median") is not None:
+                        egs_str = f"EGS: {ext['egs_median']} median"
+                        if ext.get("egs_count"):
+                            egs_str += f" ({ext['egs_count']:,} votes)"
+                        api_fields.append(egs_str)
+                    if ext.get("bangumi_score") is not None:
+                        bgm_str = f"Bangumi: {ext['bangumi_score']:.1f}/10"
+                        if ext.get("bangumi_rank"):
+                            bgm_str += f" (#{ext['bangumi_rank']:,})"
+                        api_fields.append(bgm_str)
+                    if ext.get("consensus_score") is not None:
+                        api_fields.append(f"Consensus: {ext['consensus_score']:.2f}/10")
+
                     if api_metadata.get("length"):
                         length_map = {
                             1: "Very Short (< 2 hours)",
-                            2: "Short (2-10 hours)", 
+                            2: "Short (2-10 hours)",
                             3: "Medium (10-30 hours)",
                             4: "Long (30-50 hours)",
-                            5: "Very Long (> 50 hours)"
+                            5: "Very Long (> 50 hours)",
                         }
                         length_text = length_map.get(api_metadata["length"], f"Length: {api_metadata['length']}")
                         api_fields.append(f"Length: {length_text}")
+
+                    jiten_info = api_metadata.get("jiten") or {}
+                    if jiten_info.get("character_count"):
+                        j_line = f"Script: {int(jiten_info['character_count']):,} chars"
+                        if jiten_info.get("difficulty_raw"):
+                            j_line += f" • Diff {jiten_info['difficulty_raw']:.2f}/5"
+                        api_fields.append(j_line)
+
                     if api_metadata.get("released"):
                         api_fields.append(f"Released: {api_metadata['released']}")
+
+                    links = []
                     if api_metadata.get("url"):
-                        api_fields.append(f"[View on VNDB]({api_metadata['url']})")
-                    
+                        links.append(f"[VNDB]({api_metadata['url']})")
+                    if ext.get("egs_id"):
+                        links.append(f"[EGS]({ext.get('egs_url') or egs_game_url(ext['egs_id'])})")
+                    if ext.get("bangumi_id"):
+                        links.append(f"[Bangumi]({ext.get('bangumi_url') or bangumi_subject_url(ext['bangumi_id'])})")
+                    j_deck = api_metadata.get("jiten_deck_id") or jiten_info.get("deck_id")
+                    if j_deck:
+                        links.append(f"[jiten.moe]({jiten_deck_url(j_deck)})")
+                    if links:
+                        api_fields.append(" • ".join(links))
+
                     if api_fields:
-                        embed.add_field(name="📚 VNDB Info", value="\n".join(api_fields), inline=False)
-                    
+                        embed.add_field(name="📚 VN Info", value="\n".join(api_fields), inline=False)
+
                     # Add cover image if available (never censored)
                     if api_metadata.get("cover_url"):
                         embed.set_thumbnail(url=api_metadata["cover_url"])
@@ -3722,6 +3856,80 @@ class ImmersionCog(commands.Cog):
             logger.error(f"Error in log_undo command: {e}")
             await interaction.followup.send("An error occurred while undoing the activity.", ephemeral=True)
     
+    async def _enrich_vn_library_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        fetch_titles: bool = False,
+        fetch_covers: bool = False,
+    ) -> None:
+        """Enrich visual novel library items via PostgreSQL multi-DB batch (or HTTP fallback)."""
+        vndb_ids = list({
+            item["vndb_id"]
+            for item in items
+            if item.get("vndb_id") and item.get("media_type") == "visual_novel"
+        })
+        if not vndb_ids:
+            return
+
+        vn_map = await self.media_searcher.get_vndb_batch(vndb_ids)
+        if not vn_map:
+            return
+
+        for item in items:
+            if item.get("media_type") != "visual_novel":
+                continue
+            vid = item.get("vndb_id")
+            if not vid or vid not in vn_map:
+                continue
+            vn = vn_map[vid]
+            if fetch_titles:
+                ja_title = None
+                for title_obj in vn.get("titles") or []:
+                    if title_obj.get("lang") == "ja" and title_obj.get("title"):
+                        ja_title = title_obj["title"]
+                        break
+                if not ja_title:
+                    ja_title = vn.get("title_jp")
+                if ja_title:
+                    item["name"] = ja_title
+            if fetch_covers:
+                image_info = vn.get("image") or {}
+                current_cover_url = image_info.get("url")
+                if current_cover_url:
+                    item["cover_url"] = current_cover_url
+                item["cover_is_nsfw"] = is_image_explicit(image_info.get("sexual")) or bool(
+                    vn.get("cover_blacklisted")
+                )
+            ext = vn.get("external_ratings") or {}
+            if ext.get("egs_id"):
+                item["egs_id"] = ext["egs_id"]
+            if ext.get("bangumi_id"):
+                item["bangumi_id"] = ext["bangumi_id"]
+            jiten_info = vn.get("jiten") or {}
+            if jiten_info.get("deck_id"):
+                item["jiten_deck_id"] = jiten_info["deck_id"]
+
+    @staticmethod
+    def _format_library_db_links(item: Dict[str, Any]) -> Optional[str]:
+        """Format database links for a library item."""
+        if item.get("media_type") == "visual_novel" and item.get("vndb_id"):
+            links = [f"[VNDB](https://vndb.org/{item['vndb_id']})"]
+            if item.get("egs_id"):
+                links.append(f"[EGS]({egs_game_url(item['egs_id'])})")
+            if item.get("bangumi_id"):
+                links.append(f"[Bangumi]({bangumi_subject_url(item['bangumi_id'])})")
+            if item.get("jiten_deck_id"):
+                links.append(f"[jiten]({jiten_deck_url(item['jiten_deck_id'])})")
+            return " • ".join(links)
+        if item.get("media_type") in ("anime", "manga") and item.get("anilist_id"):
+            return f"[AniList](https://anilist.co/{item['media_type']}/{item['anilist_id']})"
+        if item.get("media_type") == "game" and item.get("igdb_id"):
+            return f"[IGDB](https://www.igdb.com/games/{item['igdb_id']})"
+        if item.get("media_type") == "video" and item.get("youtube_id"):
+            return f"[YouTube](https://www.youtube.com/watch?v={item['youtube_id']})"
+        return None
+
     @app_commands.command(name="log_library", description="View your library of logged titles")
     @app_commands.describe(
         user="User to view library for (defaults to yourself)",
@@ -3786,77 +3994,12 @@ class ImmersionCog(commands.Cog):
             # For alphabetical sort, fetch Japanese titles for ALL VNs BEFORE pagination
             # This ensures sorting happens with the actual displayed titles
             if sort_by == "alphabetical":
-                vns_with_vndb_id = [
-                    item for item in library_items
-                    if item.get('vndb_id') and item['media_type'] == 'visual_novel'
-                ]
-                
-                if vns_with_vndb_id:
-                    # Batch VNDB API calls (up to 10 VNs per request)
-                    async def fetch_japanese_titles_batch(session, vndb_ids_batch):
-                        """Fetch titles for multiple VNs in a single API call"""
-                        try:
-                            payload = {
-                                "filters": ["id", "=", vndb_ids_batch if len(vndb_ids_batch) > 1 else vndb_ids_batch[0]],
-                                "fields": "id, titles.title, titles.lang",
-                                "results": len(vndb_ids_batch)
-                            }
-                            async with session.post(
-                                "https://api.vndb.org/kana/vn",
-                                json=payload,
-                                headers={"Content-Type": "application/json"},
-                                timeout=aiohttp.ClientTimeout(total=5)
-                            ) as response:
-                                if response.status == 200:
-                                    data = await response.json()
-                                    return data.get("results", [])
-                        except Exception as exc:
-                            logger.warning(f"Failed to fetch batch of {len(vndb_ids_batch)} titles: {exc}")
-                        return []
-                    
-                    # Create mapping of vndb_id to item for quick lookup
-                    vndb_id_to_items = {}
-                    for item in vns_with_vndb_id:
-                        vndb_id = item['vndb_id']
-                        if vndb_id not in vndb_id_to_items:
-                            vndb_id_to_items[vndb_id] = []
-                        vndb_id_to_items[vndb_id].append(item)
-                    
-                    # Batch VNDB IDs (10 per request - VNDB API limit)
-                    batch_size = 10
-                    vndb_ids = list(vndb_id_to_items.keys())
-                    batches = [vndb_ids[i:i + batch_size] for i in range(0, len(vndb_ids), batch_size)]
-                    
-                    async with aiohttp.ClientSession() as session:
-                        # Fetch all batches in parallel
-                        batch_results = await asyncio.gather(
-                            *[fetch_japanese_titles_batch(session, batch) for batch in batches],
-                            return_exceptions=True
-                        )
-                        
-                        # Process results and update item names
-                        for result in batch_results:
-                            if isinstance(result, list):
-                                for vn in result:
-                                    vn_id = vn.get("id")
-                                    if vn_id and vn_id in vndb_id_to_items:
-                                        titles = vn.get("titles", [])
-                                        japanese_title = None
-                                        for title_obj in titles:
-                                            if title_obj.get("lang") == "ja":
-                                                japanese_title = title_obj.get("title")
-                                                break
-                                        if japanese_title:
-                                            # Update all items with this vndb_id
-                                            for item in vndb_id_to_items[vn_id]:
-                                                item['name'] = japanese_title
-                    
-                    # Re-sort with updated Japanese titles
-                    import unicodedata
-                    def normalize_for_sort(text: str) -> str:
-                        return unicodedata.normalize('NFD', text.lower())
-                    library_items.sort(key=lambda x: normalize_for_sort(x['name']))
-                    logger.info(f"Re-sorted {len(library_items)} items alphabetically after fetching Japanese titles")
+                await self._enrich_vn_library_items(library_items, fetch_titles=True, fetch_covers=False)
+                import unicodedata
+                def normalize_for_sort(text: str) -> str:
+                    return unicodedata.normalize('NFD', text.lower())
+                library_items.sort(key=lambda x: normalize_for_sort(x['name']))
+                logger.info(f"Re-sorted {len(library_items)} items alphabetically after fetching Japanese titles")
             
             # Pagination setup - 3 items per page for gallery view (mobile-friendly)
             items_per_page = 3
@@ -3874,44 +4017,12 @@ class ImmersionCog(commands.Cog):
             end_idx = start_idx + items_per_page
             page_items = library_items[start_idx:end_idx]
             
-            # For VNs without cached NSFW status, check current VNDB cover and update if needed (parallel)
-            vns_to_check = [
-                item for item in page_items
-                if (item.get('cover_url') 
-                    and not item.get('cover_is_nsfw') 
-                    and item.get('vndb_id')
-                    and item['media_type'] == 'visual_novel')
-            ]
-            
-            if vns_to_check:
-                async def check_vn(session, item):
-                    try:
-                        payload = {
-                            "filters": ["id", "=", item['vndb_id']],
-                            "fields": "image.url, image.sexual, image.violence"
-                        }
-                        async with session.post(
-                            "https://api.vndb.org/kana/vn",
-                            json=payload,
-                            headers={"Content-Type": "application/json"},
-                            timeout=aiohttp.ClientTimeout(total=2)
-                        ) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                if data.get("results"):
-                                    vn = data["results"][0]
-                                    image_info = vn.get("image") or {}
-                                    current_cover_url = image_info.get("url")
-                                    
-                                    # Update to current cover URL and rating
-                                    if current_cover_url:
-                                        item['cover_url'] = current_cover_url
-                                    item['cover_is_nsfw'] = is_image_explicit(image_info.get("sexual"))
-                    except Exception as exc:
-                        logger.warning("Failed NSFW check for %s: %s", item['name'], exc)
-                
-                async with aiohttp.ClientSession() as session:
-                    await asyncio.gather(*[check_vn(session, item) for item in vns_to_check])
+            # Enrich page VN items (Japanese titles, NSFW cover checks, EGS/Bangumi/Jiten IDs)
+            await self._enrich_vn_library_items(
+                page_items,
+                fetch_titles=(sort_by != "alphabetical"),
+                fetch_covers=True,
+            )
 
             # Media type emojis
             media_emojis = {
@@ -3971,16 +4082,7 @@ class ImmersionCog(commands.Cog):
                 item_embed.add_field(name="📅 Last Logged", value=last_date, inline=True)
                 
                 # Add database link if available
-                db_link = None
-                if item['media_type'] == 'visual_novel' and item.get('vndb_id'):
-                    db_link = f"[VNDB](https://vndb.org/{item['vndb_id']})"
-                elif item['media_type'] in ['anime', 'manga'] and item.get('anilist_id'):
-                    db_link = f"[AniList](https://anilist.co/{item['media_type']}/{item['anilist_id']})"
-                elif item['media_type'] == 'game' and item.get('igdb_id'):
-                    db_link = f"[IGDB](https://www.igdb.com/games/{item['igdb_id']})"
-                elif item['media_type'] == 'video' and item.get('youtube_id'):
-                    db_link = f"[YouTube](https://www.youtube.com/watch?v={item['youtube_id']})"
-                
+                db_link = self._format_library_db_links(item)
                 if db_link:
                     item_embed.add_field(name="🔗 Database", value=db_link, inline=True)
                 
@@ -8211,45 +8313,12 @@ class LibraryNavigationView(discord.ui.View):
             # For alphabetical sort, fetch Japanese titles for ALL VNs BEFORE pagination
             # This ensures sorting happens with the actual displayed titles
             if self.sort_by == "alphabetical":
-                vns_with_vndb_id = [
-                    item for item in library_items
-                    if item.get('vndb_id') and item['media_type'] == 'visual_novel'
-                ]
-                
-                if vns_with_vndb_id:
-                    async def fetch_japanese_title(session, item):
-                        try:
-                            payload = {
-                                "filters": ["id", "=", item['vndb_id']],
-                                "fields": "titles.title, titles.lang"
-                            }
-                            async with session.post(
-                                "https://api.vndb.org/kana/vn",
-                                json=payload,
-                                headers={"Content-Type": "application/json"},
-                                timeout=aiohttp.ClientTimeout(total=3)
-                            ) as response:
-                                if response.status == 200:
-                                    data = await response.json()
-                                    if data.get("results"):
-                                        vn = data["results"][0]
-                                        titles = vn.get("titles", [])
-                                        for title_obj in titles:
-                                            if title_obj.get("lang") == "ja":
-                                                item['name'] = title_obj.get("title")
-                                                break
-                        except Exception as exc:
-                            logger.warning(f"Failed to fetch title for {item.get('name')}: {exc}")
-                    
-                    async with aiohttp.ClientSession() as session:
-                        await asyncio.gather(*[fetch_japanese_title(session, item) for item in vns_with_vndb_id], return_exceptions=True)
-                    
-                    # Re-sort with updated Japanese titles
-                    import unicodedata
-                    def normalize_for_sort(text: str) -> str:
-                        return unicodedata.normalize('NFD', text.lower())
-                    library_items.sort(key=lambda x: normalize_for_sort(x['name']))
-                    logger.info(f"Re-sorted {len(library_items)} items alphabetically after fetching Japanese titles")
+                await self.cog._enrich_vn_library_items(library_items, fetch_titles=True, fetch_covers=False)
+                import unicodedata
+                def normalize_for_sort(text: str) -> str:
+                    return unicodedata.normalize('NFD', text.lower())
+                library_items.sort(key=lambda x: normalize_for_sort(x['name']))
+                logger.info(f"Re-sorted {len(library_items)} items alphabetically after fetching Japanese titles")
 
             # Pagination - different items per page based on view mode
             if self.view_mode == "gallery":
@@ -8268,54 +8337,12 @@ class LibraryNavigationView(discord.ui.View):
             end_idx = start_idx + items_per_page
             page_items = library_items[start_idx:end_idx]
             
-            # For VNs with VNDB ID, fetch Japanese titles and NSFW status from VNDB API
-            # This must complete BEFORE embeds are built
-            vns_to_check = [
-                item for item in page_items
-                if item.get('vndb_id') and item['media_type'] == 'visual_novel'
-            ]
-            
-            if vns_to_check:
-                async def check_vn(session, item):
-                    try:
-                        payload = {
-                            "filters": ["id", "=", item['vndb_id']],
-                            "fields": "titles.title, titles.lang, image.url, image.sexual, image.violence"
-                        }
-                        async with session.post(
-                            "https://api.vndb.org/kana/vn",
-                            json=payload,
-                            headers={"Content-Type": "application/json"},
-                            timeout=aiohttp.ClientTimeout(total=3)
-                        ) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                if data.get("results"):
-                                    vn = data["results"][0]
-                                    
-                                    # Get Japanese title from titles array
-                                    titles = vn.get("titles", [])
-                                    for title_obj in titles:
-                                        if title_obj.get("lang") == "ja":
-                                            # Update the name in place
-                                            item['name'] = title_obj.get("title")
-                                            break
-                                    
-                                    # Update cover and NSFW status
-                                    image_info = vn.get("image") or {}
-                                    current_cover_url = image_info.get("url")
-                                    
-                                    if current_cover_url:
-                                        item['cover_url'] = current_cover_url
-                                    item['cover_is_nsfw'] = is_image_explicit(image_info.get("sexual"))
-                    except asyncio.TimeoutError:
-                        logger.warning("[Pagination] VNDB lookup timeout for %s", item.get('name', 'unknown'))
-                    except Exception as exc:
-                        logger.warning("[Pagination] Failed VNDB lookup for %s: %s", item.get('name', 'unknown'), exc)
-                
-                # Wait for ALL VNDB lookups to complete before proceeding
-                async with aiohttp.ClientSession() as session:
-                    await asyncio.gather(*[check_vn(session, item) for item in vns_to_check], return_exceptions=True)
+            # Enrich page VN items via PostgreSQL multi-DB batch (or HTTP fallback)
+            await self.cog._enrich_vn_library_items(
+                page_items,
+                fetch_titles=(self.sort_by != "alphabetical"),
+                fetch_covers=True,
+            )
 
 
             
@@ -8379,16 +8406,7 @@ class LibraryNavigationView(discord.ui.View):
                     item_embed.add_field(name="📅 Last Logged", value=last_date, inline=True)
                     
                     # Add database link if available
-                    db_link = None
-                    if item['media_type'] == 'visual_novel' and item.get('vndb_id'):
-                        db_link = f"[VNDB](https://vndb.org/{item['vndb_id']})"
-                    elif item['media_type'] in ['anime', 'manga'] and item.get('anilist_id'):
-                        db_link = f"[AniList](https://anilist.co/{item['media_type']}/{item['anilist_id']})"
-                    elif item['media_type'] == 'game' and item.get('igdb_id'):
-                        db_link = f"[IGDB](https://www.igdb.com/games/{item['igdb_id']})"
-                    elif item['media_type'] == 'video' and item.get('youtube_id'):
-                        db_link = f"[YouTube](https://www.youtube.com/watch?v={item['youtube_id']})"
-                    
+                    db_link = self.cog._format_library_db_links(item)
                     if db_link:
                         item_embed.add_field(name="🔗 Database", value=db_link, inline=True)
                     
@@ -8438,15 +8456,7 @@ class LibraryNavigationView(discord.ui.View):
                     display_name = item['name'][:100] if len(item['name']) > 100 else item['name']
 
                     # Build database link
-                    db_link = None
-                    if item['media_type'] == 'visual_novel' and item.get('vndb_id'):
-                        db_link = f"[VNDB](https://vndb.org/{item['vndb_id']})"
-                    elif item['media_type'] in ['anime', 'manga'] and item.get('anilist_id'):
-                        db_link = f"[AniList](https://anilist.co/{item['media_type']}/{item['anilist_id']})"
-                    elif item['media_type'] == 'game' and item.get('igdb_id'):
-                        db_link = f"[IGDB](https://www.igdb.com/games/{item['igdb_id']})"
-                    elif item['media_type'] == 'video' and item.get('youtube_id'):
-                        db_link = f"[YouTube](https://www.youtube.com/watch?v={item['youtube_id']})"
+                    db_link = self.cog._format_library_db_links(item)
 
                     # Format line
                     line = f"`{i}.` {emoji} **{display_name}**"

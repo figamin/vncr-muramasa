@@ -21,8 +21,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.helpers import extract_vndb_id
+from utils.helpers import (
+    bangumi_subject_url,
+    egs_game_url,
+    extract_vndb_id,
+    jiten_deck_url,
+)
 from utils.jiten_client import JitenClient
+from utils.pg_db import get_pg_db
 from utils.vn_duration import (
     PARAMS_VERSION,
     DurationParams,
@@ -133,6 +139,31 @@ class VnOfMonthCog(commands.Cog):
             value=f"{start:%d %b %Y} → **{end:%d %b %Y}**",
             inline=False,
         )
+
+        ext = vn_data.get("external_ratings") or {}
+        jiten_info = vn_data.get("jiten") or {}
+        links = []
+        if estimate.vndb_id:
+            links.append(f"[VNDB](https://vndb.org/{estimate.vndb_id})")
+        if ext.get("egs_id"):
+            links.append(f"[EroGamescape]({ext.get('egs_url') or egs_game_url(ext['egs_id'])})")
+        if ext.get("bangumi_id"):
+            links.append(f"[Bangumi]({ext.get('bangumi_url') or bangumi_subject_url(ext['bangumi_id'])})")
+        if jiten_info.get("deck_id"):
+            links.append(f"[jiten.moe]({jiten_deck_url(jiten_info['deck_id'])})")
+        if links:
+            score_bits = []
+            if ext.get("egs_median") is not None:
+                score_bits.append(f"EGS: {ext['egs_median']} median")
+            if ext.get("bangumi_score") is not None:
+                score_bits.append(f"Bangumi: {ext['bangumi_score']:.1f}/10")
+            if ext.get("consensus_score") is not None:
+                score_bits.append(f"Consensus: {ext['consensus_score']:.2f}/10")
+            value = " • ".join(links)
+            if score_bits:
+                value = " • ".join(score_bits) + "\n" + value
+            embed.add_field(name="🔗 Multi-DB Sources", value=value[:1024], inline=False)
+
         embed.set_footer(
             text=f"Estimator {PARAMS_VERSION} · preview only, nothing was scheduled"
         )
@@ -171,11 +202,19 @@ class VnOfMonthCog(commands.Cog):
     ):
         # Validated before acknowledging so this error can stay private even when
         # the result itself is going to be posted publicly.
-        resolved = extract_vndb_id(vndb_id) or extract_vndb_id(f"v{vndb_id.strip()}")
+        pg = get_pg_db()
+        resolved = None
+        if pg.is_configured:
+            try:
+                resolved = await pg.resolve_vndb_id(vndb_id)
+            except Exception as exc:
+                logger.debug("PG resolve_vndb_id failed in vn_window: %s", exc)
+        if not resolved:
+            resolved = extract_vndb_id(vndb_id) or extract_vndb_id(f"v{vndb_id.strip()}")
         if not resolved:
             await interaction.response.send_message(
-                "❌ That doesn't look like a VNDB id. Try `v38511` or "
-                "`https://vndb.org/v38511`.",
+                "❌ That doesn't look like a VNDB, EroGamescape, or Bangumi id/URL. "
+                "Try `v38511` or `https://vndb.org/v38511`.",
                 ephemeral=True,
             )
             return

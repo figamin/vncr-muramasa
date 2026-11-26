@@ -216,6 +216,9 @@ def format_rating(rating: float) -> str:
 
 def extract_vndb_id(text: str) -> Optional[str]:
     """Extract VNDB ID from various formats"""
+    if not text:
+        return None
+    text = text.strip()
     # If it's just a number, add 'v' prefix
     if text.isdigit():
         return f"v{text}"
@@ -232,29 +235,78 @@ def extract_vndb_id(text: str) -> Optional[str]:
     
     return None
 
+
+def extract_egs_id(text: str) -> Optional[int]:
+    """Extract EroGamescape game ID from URL or prefixed ID (e.g. egs:10469)."""
+    if not text:
+        return None
+    text = text.strip()
+    match = re.search(r'erogamescape\.[^/]+/[^?]*game\.php\?[^#]*game=(\d+)', text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r'^egs\s*[:#]\s*(\d+)$', text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def extract_bangumi_id(text: str) -> Optional[int]:
+    """Extract Bangumi subject ID from URL or prefixed ID (e.g. bgm:3243)."""
+    if not text:
+        return None
+    text = text.strip()
+    match = re.search(r'(?:bgm\.tv|bangumi\.tv|chii\.in)/subject/(\d+)', text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r'^(?:bgm|bangumi)\s*[:#]\s*(\d+)$', text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def egs_game_url(egs_id: int) -> str:
+    """Build EroGamescape game page URL."""
+    return f"https://erogamescape.dyndns.org/~ap2/ero/toukei_kaiseki/game.php?game={int(egs_id)}"
+
+
+def bangumi_subject_url(bangumi_id: int) -> str:
+    """Build Bangumi subject page URL."""
+    return f"https://bgm.tv/subject/{int(bangumi_id)}"
+
+
+def jiten_deck_url(deck_id: int) -> str:
+    """Build jiten.moe media deck detail URL."""
+    return f"https://jiten.moe/decks/media/{int(deck_id)}/detail"
+
 from .constants import NSFW_SEXUAL_THRESHOLD
 
 def is_content_nsfw(vn_data: dict) -> bool:
     """
     Check if a VN's cover should be treated as NSFW.
 
-    Trusts VNDB's own image rating (``image.sexual``): VNDB moderators rate
-    each cover image directly on a 0/1/2 scale (safe/suggestive/explicit), and
-    that rating is the only reliable per-cover signal. Covers at or above
+    Trusts VNDB's own image rating (``image.sexual``) and the VNCR cover
+    blacklist when available. VNDB moderators rate each cover image directly on
+    a 0/1/2 scale (safe/suggestive/explicit), and covers at or above
     NSFW_SEXUAL_THRESHOLD are hidden.
 
-    Tag ratings are not used: they reflect whether a *theme* is present in
-    the work, not whether the *cover art* depicts it, so a VN can carry highly
-    rated explicit-theme tags while having an entirely safe cover.
-
     Args:
-        vn_data: VN data from VNDB API
+        vn_data: VN data from VNDB API or multi-DB
 
     Returns:
         True if the cover should be hidden, False otherwise
     """
-    image_sexual = vn_data.get('image', {}).get('sexual', 0)
-    return image_sexual >= NSFW_SEXUAL_THRESHOLD
+    if not isinstance(vn_data, dict):
+        return False
+    if vn_data.get('cover_blacklisted'):
+        return True
+    image = vn_data.get('image') or {}
+    image_sexual = image.get('sexual')
+    if image_sexual is None:
+        return False
+    try:
+        return float(image_sexual) >= NSFW_SEXUAL_THRESHOLD
+    except (TypeError, ValueError):
+        return False
 
 def get_safe_image_url(vn_data: dict, hide_nsfw: bool = True) -> Optional[str]:
     """

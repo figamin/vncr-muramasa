@@ -15,7 +15,7 @@ from utils import (
     format_date, format_rating, format_vn_length,
     truncate_text, convert_bbcode_to_markdown, extract_vndb_id, validate_month_year, get_month_name,
     is_content_nsfw, get_safe_image_url, parse_completion_date, calculate_vn_score,
-    days_in_month, chars_per_day,
+    days_in_month, chars_per_day, egs_game_url, bangumi_subject_url, jiten_deck_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -659,19 +659,36 @@ class VNMonthCog(commands.Cog):
     MAX_BANNERS_PER_RESPONSE = 4
 
     @staticmethod
-    def _build_vn_links_view(vndb_id: str, jiten_deck_id: Optional[int]) -> discord.ui.View:
-        """Link buttons attached to each banner: VNDB + VN Club always, jiten only if known."""
+    def _build_vn_links_view(
+        vndb_id: str,
+        jiten_deck_id: Optional[int],
+        egs_id: Optional[int] = None,
+        bangumi_id: Optional[int] = None,
+    ) -> discord.ui.View:
+        """Link buttons attached to each banner (max 5 in one row)."""
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(
             label="VNDB",
             style=discord.ButtonStyle.link,
             url=f"https://vndb.org/{vndb_id}",
         ))
+        if egs_id is not None:
+            view.add_item(discord.ui.Button(
+                label="EroGamescape",
+                style=discord.ButtonStyle.link,
+                url=egs_game_url(egs_id),
+            ))
+        if bangumi_id is not None:
+            view.add_item(discord.ui.Button(
+                label="Bangumi",
+                style=discord.ButtonStyle.link,
+                url=bangumi_subject_url(bangumi_id),
+            ))
         if jiten_deck_id is not None:
             view.add_item(discord.ui.Button(
                 label="jiten.moe",
                 style=discord.ButtonStyle.link,
-                url=f"https://jiten.moe/decks/media/{jiten_deck_id}/detail",
+                url=jiten_deck_url(jiten_deck_id),
             ))
         view.add_item(discord.ui.Button(
             label="VN Club",
@@ -724,7 +741,11 @@ class VNMonthCog(commands.Cog):
                 content_tags.sort(key=lambda t: t.get('rating') or 0, reverse=True)
                 top_tags = [t['name'] for t in content_tags[:5]]
 
-                info = await jiten.get_by_vndb_id(vndb_id)
+                ext = fresh.get('external_ratings') or {}
+                egs_id = ext.get('egs_id')
+                bangumi_id = ext.get('bangumi_id')
+
+                info = await jiten.get_by_vndb_id(vndb_id, need_cover=cover_nsfw)
                 if info:
                     total_chars = info.character_count or None
                     difficulty = info.difficulty_raw or None
@@ -761,13 +782,21 @@ class VNMonthCog(commands.Cog):
                     dialogue_pct=dialogue_pct,
                     release_year=release_year,
                     top_tags=top_tags,
+                    egs_median=ext.get('egs_median'),
+                    bangumi_score=ext.get('bangumi_score'),
+                    consensus_score=ext.get('consensus_score'),
                 )
 
                 file = discord.File(
                     png,
                     filename=f"vnmonth_{vndb_id}_{target_year}_{target_month:02d}.png",
                 )
-                view = self._build_vn_links_view(vndb_id, jiten_deck_id)
+                view = self._build_vn_links_view(
+                    vndb_id,
+                    jiten_deck_id,
+                    egs_id=egs_id,
+                    bangumi_id=bangumi_id,
+                )
                 # The first followup carries the month caption; the rest are quiet.
                 content = caption if index == 0 else None
                 await interaction.followup.send(content=content, file=file, view=view)

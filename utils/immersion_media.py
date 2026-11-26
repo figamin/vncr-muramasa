@@ -278,10 +278,12 @@ class MediaSearcher:
                     "titles": title_data,
                     "display": display_title,
                     "image": image.get("url"),
-                    "image_is_nsfw": image_is_explicit,
+                    "image_is_nsfw": image_is_explicit or bool(vn.get("cover_blacklisted")),
+                    "cover_blacklisted": bool(vn.get("cover_blacklisted")),
                     "rating": vn.get("rating"),
                     "released": vn.get("released"),
                     "image_sexual": sexual_level_value,
+                    "external_ratings": vn.get("external_ratings"),
                 })
 
             return results
@@ -289,6 +291,18 @@ class MediaSearcher:
         except Exception as exc:  # pragma: no cover - network failure path
             logger.error("Error searching visual novels: %s", exc)
             return []
+
+    async def get_vndb_batch(self, vndb_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Batch-fetch VNDB metadata (PostgreSQL first, HTTP API fallback)."""
+        if not vndb_ids:
+            return {}
+        try:
+            client = self._create_vndb_client()
+            async with client as api:
+                return await api.get_vns_by_ids(vndb_ids)
+        except Exception as exc:
+            logger.error("Error batch-fetching VNDB metadata: %s", exc)
+            return {}
     
     def _normalize_anilist_media(
         self,

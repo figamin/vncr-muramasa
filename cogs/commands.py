@@ -530,7 +530,8 @@ class CommandsCog(commands.Cog):
                     embed.description = "Helpful utility and resource commands"
                     embed.add_field(
                         name="🛠️ Utility Commands",
-                        value="`/ankileaderboard`: Join the VNCR Anki leaderboard\n"
+                        value="`/vn`: Look up a VN across VNDB, EroGamescape, Bangumi, and Jiten\n"
+                              "`/ankileaderboard`: Join the VNCR Anki leaderboard\n"
                               "`/resources`: Access VN Club resource site\n"
                               "`/getvns`: Get links to download visual novels\n"
                               "`/guide`: Share the Japanese learning guide",
@@ -872,6 +873,19 @@ class CommandsCog(commands.Cog):
         }
 
         vn_commands_info = {
+            "vn": {
+                "category": "🛠️ Utility Commands",
+                "usage": "/vn query:<title, ID, or URL>",
+                "description": "Look up a visual novel across VNDB, EroGamescape, Bangumi, and Jiten",
+                "details": "Searches VNDB, EroGamescape (including furigana), and Bangumi titles, or accepts a VNDB/EGS/Bangumi ID or URL. Shows scores, consensus rating, playtime estimates, Jiten script stats, tags, and non-spoiler EGS POVs.",
+                "examples": [
+                    "/vn query:装甲悪鬼村正",
+                    "/vn query:v2016",
+                    "/vn query:https://erogamescape.dyndns.org/~ap2/ero/toukei_kaiseki/game.php?game=10469",
+                    "/vn query:https://bgm.tv/subject/3243"
+                ],
+                "admin_only": False
+            },
             "vn_window": {
                 "category": "⚙️ Admin Commands",
                 "usage": "/vn_window vndb_id:<id or url> [public:<bool>] [lookback_days:<7-365>] [slack:<0-1>] [max_days:<7-365>] [assume_chars_per_hour:<int>] [assume_session_hours:<float>]",

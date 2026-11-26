@@ -111,6 +111,7 @@ class WindowEstimate:
     difficulty: Optional[float] = None
     length_minutes: Optional[float] = None
     length_votes: Optional[int] = None
+    egs_playtime_hours: Optional[float] = None
 
     text_hours: Optional[float] = None          # T_M
     difficulty_multiplier: float = 1.0          # m_D
@@ -156,6 +157,10 @@ class WindowEstimate:
                 f"{hours((self.length_minutes or 0) / 60)} "
                 f"({self.length_votes or 0} votes)"
             )),
+        ]
+        if self.egs_playtime_hours:
+            rows.append(("EGS playtime", f"{format_hours(self.egs_playtime_hours)} (median)"))
+        rows.extend([
             ("Script length", f"{self.moji:,} moji" if self.moji else "unknown"),
             ("Difficulty (jiten)", f"{self.difficulty:.2f}" if self.difficulty is not None else "unknown"),
             ("Native estimate T_M", hours(self.text_hours)),
@@ -169,7 +174,7 @@ class WindowEstimate:
             ("Daily commitment d", f"{self.daily_hours:.2f} h/day"),
             ("With slack", hours(self.total_hours)),
             ("Raw window", f"{self.raw_days:.1f} days"),
-        ]
+        ])
         return rows
 
 
@@ -223,6 +228,7 @@ def estimate_window(
     difficulty: Optional[float] = None,
     length_minutes: Optional[float] = None,
     length_votes: Optional[int] = None,
+    egs_playtime_hours: Optional[float] = None,
     server_chars_per_hour: Optional[float] = None,
     session_hours: Optional[float] = None,
     params: DurationParams = DurationParams(),
@@ -230,8 +236,8 @@ def estimate_window(
 ) -> WindowEstimate:
     """Compute how many days a group needs to read one visual novel.
 
-    ``moji`` and/or ``length_minutes`` must be supplied; everything else
-    degrades gracefully to a neutral assumption (documented in ``notes``).
+    ``moji``, ``length_minutes``, and/or ``egs_playtime_hours`` must be supplied;
+    everything else degrades gracefully to a neutral assumption (documented in ``notes``).
     """
     estimate = WindowEstimate(
         vndb_id=vndb_id,
@@ -239,13 +245,14 @@ def estimate_window(
         difficulty=float(difficulty) if difficulty else None,
         length_minutes=float(length_minutes) if length_minutes else None,
         length_votes=int(length_votes) if length_votes is not None else None,
+        egs_playtime_hours=float(egs_playtime_hours) if egs_playtime_hours else None,
         max_days=params.max_days,
         min_days=params.min_days,
     )
     notes = estimate.notes
 
-    if not estimate.moji and not estimate.length_minutes:
-        raise ValueError("estimate_window needs moji or length_minutes")
+    if not estimate.moji and not estimate.length_minutes and not estimate.egs_playtime_hours:
+        raise ValueError("estimate_window needs moji, length_minutes, or egs_playtime_hours")
 
     # --- 1. text-based native estimate ------------------------------------
     text_hours = hours_from_moji(estimate.moji, params)
@@ -253,7 +260,7 @@ def estimate_window(
         estimate.text_hours = text_hours
         estimate.difficulty_multiplier = difficulty_multiplier(estimate.difficulty, params)
     else:
-        notes.append("No jiten character count: using the VNDB average only.")
+        notes.append("No jiten character count: using playtime average only.")
         estimate.difficulty_multiplier = 1.0
 
     adjusted_text = (
@@ -261,7 +268,7 @@ def estimate_window(
         if estimate.text_hours is not None else None
     )
 
-    # --- 2. blend toward VNDB ---------------------------------------------
+    # --- 2. blend toward VNDB (or EGS median playtime fallback) ------------
     estimate.blend_beta = blend_beta(
         estimate.length_votes, estimate.text_hours is not None, params
     )
@@ -274,11 +281,19 @@ def estimate_window(
                 f"VNDB has only {estimate.length_votes or 0} playtime votes; the "
                 "script length carries more weight."
             )
-    elif adjusted_text:
-        estimate.native_hours = adjusted_text
-        notes.append("No VNDB playtime: using the script-based estimate.")
-    else:  # VNDB only
-        estimate.native_hours = (estimate.length_minutes or 0) / 60.0
+    elif estimate.length_minutes:
+        estimate.native_hours = estimate.length_minutes / 60.0
+    elif estimate.egs_playtime_hours and adjusted_text:
+        anchor = estimate.egs_playtime_hours
+        ratio = adjusted_text / anchor if anchor > 0 else 1.0
+        estimate.native_hours = anchor * (ratio ** estimate.blend_beta)
+        notes.append("No VNDB playtime: using EroGamescape median playtime.")
+    elif estimate.egs_playtime_hours:
+        estimate.native_hours = estimate.egs_playtime_hours
+        notes.append("No VNDB playtime: using EroGamescape median playtime.")
+    else:
+        estimate.native_hours = adjusted_text or 0.0
+        notes.append("No VNDB or EGS playtime: using the script-based estimate.")
 
     # --- 3. server speed ratio --------------------------------------------
     if server_chars_per_hour and server_chars_per_hour > 0:
@@ -348,11 +363,14 @@ def estimate_from_sources(
     moji = getattr(jiten_info, "character_count", None) if jiten_info else None
     difficulty = getattr(jiten_info, "difficulty_raw", None) if jiten_info else None
 
+    ext = vndb.get("external_ratings") or {}
+    egs_playtime_hours = ext.get("egs_playtime_median")
+
     length_minutes = vndb.get("length_minutes")
     length_votes = vndb.get("length_votes")
-    if not length_minutes:
-        # Fall back to the length bucket (1-5) midpoints when the API/cache
-        # predates the length_minutes field.
+    if not length_minutes and not egs_playtime_hours:
+        # Fall back to the length bucket (1-5) midpoints when neither
+        # length_minutes nor EGS playtime is available.
         bucket_hours = {1: 1.5, 2: 6.0, 3: 20.0, 4: 40.0, 5: 80.0}
         bucket = vndb.get("length")
         if isinstance(bucket, (int, float)) and int(bucket) in bucket_hours:
@@ -368,6 +386,7 @@ def estimate_from_sources(
         difficulty=difficulty,
         length_minutes=length_minutes,
         length_votes=length_votes,
+        egs_playtime_hours=egs_playtime_hours,
         server_chars_per_hour=server_cph,
         session_hours=session,
         params=params,

@@ -101,7 +101,7 @@ start_web_console_thread()
 
 # Load cogs
 async def load_extensions():
-    for cog in ['cogs.commands', 'cogs.events', 'cogs.vn_month', 'cogs.vn_of_month', 'cogs.backup', 'cogs.server_backup', 'cogs.error_logging', 'cogs.verification', 'cogs.onboarding', 'cogs.immersion', 'cogs.highlights', 'cogs.sticky_messages', 'cogs.kizuna', 'cogs.daily_log_summary', 'cogs.message_purge', 'cogs.role_menu', 'cogs.message_filter', 'cogs.media_flag']:
+    for cog in ['cogs.commands', 'cogs.events', 'cogs.vn_month', 'cogs.vn_of_month', 'cogs.vn_lookup', 'cogs.backup', 'cogs.server_backup', 'cogs.error_logging', 'cogs.verification', 'cogs.onboarding', 'cogs.immersion', 'cogs.highlights', 'cogs.sticky_messages', 'cogs.kizuna', 'cogs.daily_log_summary', 'cogs.message_purge', 'cogs.role_menu', 'cogs.message_filter', 'cogs.media_flag']:
         try:
             await bot.load_extension(cog)
             logger.info(f'Loaded cog: {cog}')
@@ -168,9 +168,14 @@ async def main():
             token = load_token()
             await bot.start(token)
         finally:
-            # Clean up registry on shutdown
+            # Clean up registry and PostgreSQL pools on shutdown
             logger.info("Cleaning up guild registry...")
             remove_bot_guilds("Main Bot")
+            try:
+                from utils.pg_db import get_pg_db
+                await get_pg_db().close()
+            except Exception as e:
+                logger.debug(f"Error closing PG pools on shutdown: {e}")
 
 # Anime bot startup function
 async def start_anime_bot():
